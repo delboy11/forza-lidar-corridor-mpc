@@ -1,0 +1,8 @@
+numpy==1.24.4
+scipy==1.15.3
+numba==0.60.0
+osqp==1.1.3
+casadi==3.8.1      # only for libhpipm.so (the QP solver the MPC calls through ctypes)
+pyyaml>=5.4
+pillow>=9.0
+# ROS 2 Humble (rclpy, sensor_msgs, geometry_msgs, nav_msgs, ackermann_msgs, visualization_msgs) comes from /opt/ros/humble
