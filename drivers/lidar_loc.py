@@ -552,13 +552,14 @@ class LidarLocalizer:
         # walls do.  Normal tracking: q >= 0.97 also with 3 cm scan noise; a mirrored pose in a corridor reached 0.84.
         # q_min_inl: the inliers must also be this fraction of all valid beams
         # Free-space endpoints count as explained only in compact runs (obstacle-like: consecutive endpoints <= obs_link
-        # apart, first to last <= obs_ext; the obstacles are 0.30 m cubes): a displaced pose had 46 % inliers and 50 %
-        # free-space endpoints along walls; real obstacles covered up to 27 % of the beams.
+        # apart, first to last <= obs_ext): a free-space run shorter than obs_ext is treated as an obstacle, not as
+        # evidence of a wrong pose.  A displaced pose gives wall runs of several metres (46 % inliers and 50 %
+        # free-space endpoints along walls); real obstacles covered up to 27 % of the beams.
         # q_bad 0.9: tracking stays >= 0.97 (3 cm scan noise, obstacles); a wrong step count gave 0.81-0.83 fits
         # q_min_inl / q_min_inl_reloc: floors on the inlier fraction of all valid beams (the compact-run rule rejects
         # displaced poses by itself; an obstacle 9 cm in front of the LiDAR covered 75 % of the beams)
         q_bad=0.9, q_lost=0.3, lost_n=3, q_ok=0.95, jump_gate=0.5, q_min_inl=0.2, q_min_inl_reloc=0.25,
-        obs_link=0.2, obs_ext=0.55,
+        obs_link=0.2, obs_ext=1.0,
         # an init / relocalisation candidate must also fit as well as tracking does: inlier RMS <= max(rms_ok_k ref,
         # ref + rms_ok_add), ref = beam noise (EMA of the tracking RMS).  A spurious along-track minimum 0.12 m off had
         # 100 % inliers but RMS 0.0195 against 0.0136 at the true pose
@@ -608,7 +609,7 @@ class LidarLocalizer:
         _predict_ekf(z, z, z, 0, 0.03, 0.02, 0.0, 2, np.array([0.0, 0, 0, 1.0, 0, 0]), np.eye(6), 0.0, 1.0, self.Qd,
                      self.Pmax)
         _register(np.zeros(6), np.eye(6), np.ones(NB), self.cb, self.sb, 2, 0.06, 20.0, m.sdf, m.ox, m.oy, m.res,
-                  m.W, m.H, 0.015, 0.0015, -0.02, 0.0, 2.0, 0.25, 0.08, 0.08, 10.0, 2, True, 0.2, 0.55)
+                  m.W, m.H, 0.015, 0.0015, -0.02, 0.0, 2.0, 0.25, 0.08, 0.08, 10.0, 2, True, 0.2, 1.0)
         S0 = np.zeros((2, 6))
         S0[:, 3] = 1.0
         S1, P1, _ = _mm_predict(z, z, z, 0, np.array([0.02, 0.03]), 0.02, 0.0, 2, S0, np.stack([np.eye(6)] * 2),

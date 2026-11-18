@@ -1,4 +1,4 @@
-"""ROS 2 wrapper for an offline-harness driver: /scan + /car_state/pose_GT + /car_state/odom_GT -> /drive.
+"""ROS 2 wrapper for an offline-harness driver: /scan (+ /car_state/pose_GT + /car_state/odom_GT in GT mode) -> /drive.
 
 The driver class is the same one evaluated in harness.py (act(scan, x, y, yaw, v, yaw_rate, t)),
 so what was measured offline is what runs here.
@@ -11,8 +11,8 @@ ROS specifics the harness does not have:
 - /initialpose (operator or scorer reset) -> driver.reset(); a driver with set_initial_pose(x, y, yaw) (e.g.
   drivers.lidar_loc:LidarLocDriver, which estimates its state from the scan) also gets the operator's pose, and the
   scans received before the reset are dropped (they may predate the teleport).
-- a driver with gt_free == True (LidarLocDriver with forbid_gt=True) gets NaN instead of pose_GT / odom_GT and is called
-  on every new scan without waiting for GT messages: nothing of the ground truth reaches it.
+- a driver with gt_free == True (LidarLocDriver with forbid_gt=True): the node does not subscribe to pose_GT / odom_GT
+  at all; the driver gets NaN in their place and is called on every new scan.
 - an exception in act() publishes a stop instead of leaving the bridge on the last command.
 
 usage: python3 avoid_node.py <module:Class> ['<json kwargs>'] [rate_hz]   (run from ~/avoid)
@@ -54,8 +54,10 @@ class AvoidNode(Node):
         self.failed = False
         self.ms, self.lat_ms, self.unmatched = [], [], 0
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 20)
-        self.create_subscription(PoseStamped, '/car_state/pose_GT', self.pose_cb, 20)
-        self.create_subscription(Odometry, '/car_state/odom_GT', self.odom_cb, 20)
+        if not self.gt_free:
+            # GT mode only: a gt_free driver gets no ground truth at all, so the node does not subscribe to it
+            self.create_subscription(PoseStamped, '/car_state/pose_GT', self.pose_cb, 20)
+            self.create_subscription(Odometry, '/car_state/odom_GT', self.odom_cb, 20)
         self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self.reset_cb, 10)
         self.pub = self.create_publisher(AckermannDriveStamped, '/drive', 10)
         # drivers that estimate their own state (LidarLocDriver) publish it for display / evaluation in RViz
@@ -156,9 +158,10 @@ class AvoidNode(Node):
 
     def report(self):
         if self.ms:
-            v = self.odoms[next(reversed(self.odoms))][0] if self.odoms else 0.0
             if self.gt_free:
                 v = float(getattr(self.driver, 'v_est', math.nan))
+            else:
+                v = self.odoms[next(reversed(self.odoms))][0] if self.odoms else 0.0
             self.get_logger().info(
                 f'v={v:.2f} act {np.mean(self.ms):.1f} ms (p99 {np.percentile(self.ms, 99):.1f}), '
                 f'obs->cmd {np.mean(self.lat_ms):.1f} ms (p99 {np.percentile(self.lat_ms, 99):.1f}, '

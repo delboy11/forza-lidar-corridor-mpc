@@ -44,7 +44,7 @@ Pipeline per act():
      the closest), with a side-flip penalty (hysteresis) that becomes almost hard close to the obstacle.
      The chosen sides define an exact corridor lb(s) <= d <= ub(s) for the body line (obstacle and wall
      bounds already inflated by the collision-box half width + margin).
-  4. spatial LTV-MPC (OSQP) on the simulator's own linear-tyre single-track model in Frenet coordinates:
+  4. spatial LTV-MPC (HPIPM) on the simulator's own linear-tyre single-track model in Frenet coordinates:
      states d, mu (yaw rel. raceline), beta, r, delta; input steering rate (|.| <= 3.2 rad/s); exact
      discretisation per station along the planned speed profile, load transfer from the planned
      acceleration.  Corridor constraints on three points of the collision box (soft, heavy penalty),
@@ -67,15 +67,20 @@ Changes of the second development round (see work/corridor_mpc/):
   * resolve_da: when the new speed profile changes the near-term acceleration by > 2 m/s^2 (e.g. a swerve that
     starts braking now), the MPC is solved a second time with it (load-transfer transients, p99 |v r| outliers).
   * v_vis_safe: the first unseen path point must be reached at <= 2.5 m/s (not at standstill).
-Optional, off by default (tested, no net gain): yaw_lim, gg, swerve_w, a_acc_launch, escape, vis_obs_stop.
+Options that were off in every profile (tested, no net gain) were deleted on 2026-11-19 (work/advice_fix/refactor:
+a_lat_fb, gain_comp, yaw_lim, gg / gg_min, swerve_w, a_acc_launch / v_launch, escape, vis_obs_stop, box_mono,
+occl_ext / occl_fix, the debug dicts), together with the jit=False numpy reference code, the OSQP solver path and
+acc_model=False; commands are bit-identical.  The last version with them is frozen in
+work/advice_fix/refactor/reference/drivers/cmpc_berlin_tt.py (the reference for future kernel checks).  Passing a
+removed kwarg raises KeyError.
 
 Compute-time round (work/rob_compute/): act() spent most of its time in many small numpy calls (Python overhead,
 slow with the cold caches of a busy machine), in HPIPM (generic blasfeo build, ~130-180 us per IPM iteration, two
 solves when resolve_da fires) and, with noisy scans, in Python loops over the remembered cells / boxes and linear
 searches over lap-long lists; nothing per call scaled with the map, but the slowest calls (MPC phase with a re-solve)
-reached 30+ ms on a loaded machine.  With jit=True (default) the per-call numerics run in numba kernels (compiled /
-loaded in __init__, one signature each) that repeat the numpy code operation by operation (same results up to the
-last bit of a few transcendental functions; jit=False is the unchanged reference code):
+reached 30+ ms on a loaded machine.  The per-call numerics run in numba kernels (compiled / loaded in __init__, one
+signature each) that repeat the numpy code operation by operation (same results up to the last bit of a few
+transcendental functions; the numpy reference code is kept only in the frozen copy named above):
   * MPC data straight into HPIPM's buffers (_mpc_hp_k, structure-aware expm), speed profile (_speed_k), the plan's
     inputs (_plan_prep_k), DP grid / costs / back-tracking (_dp_k), actuator model loops (_obs_main_k, _obs_beta_k, _predict_k).
   * perception: scan hits (_hits_k); the remembered cells keep their map attributes and counts in arrays aligned
@@ -127,6 +132,84 @@ Unseen / narrow maps (work/rob2/maps_REPORT.md):
     raceline (repairing a marginal one, glc_ot_ez with max kappa 1.07, cost more than it gained).
   * dp_kgeo: the DP charges slope changes that make the geometric path curvature kr / D + d'' / D^2 (D = 1 - kr d)
     exceed the steering limit; it used to bound d'' only, so the inside of a tight turn looked as easy as the outside.
+
+berlin with random static obstacles (profiles/berlin_obs.json = berlin_tt.json + obstacle options).  The options were
+a subclass, drivers.cmpc_berlin_obs.CorridorMPC, with its own copies of act() and _plan_rest(); on 2026-11-19 they were
+merged into this class (work/advice_fix/refactor).  Every option is off by default ('off' = the time-trial driver; at
+the merge the time-trial profiles drove bit-identically); drivers.cmpc_berlin_obs keeps the import path.
+
+Obstacle options (EXTRA; mechanisms they fix: work/berlin_obs/REPORT.md, M1-M6):
+  * obstacle mode (obs_mem < 0: per lap): on in the first lap, in every lap after a lap in which a box was seen and
+    from the first box of a lap on; obs_kw = parameter overrides in that mode (t_react, sight envelope, low-speed
+    margins, gap rule).  A clear track is driven with the time-trial parameters from the second lap on.
+  * width-gated horizon frontier (v_hz, m_hz, w_front, hz_look, front_ramp): where the track near the horizon end is
+    narrower than w_front, the car must be able to reach v_hz there (an obstacle chicane can appear at the horizon
+    end and is not passable at speed); static ramped cap before it (M1).
+  * em_frac: the closed-corridor stop envelope again with em_frac of the emergency deceleration (M1 / M2 tracking).
+  * narrow-side closing in the DP (g_narrow, g_diff; part of the gap rule) (M3).
+  * slow DP (v_slow, kcap_slow, kmax_slow, dp_adec_slow, slow_pre, slow_len, m_slow, slow_commit): when the DP finds no
+    path, plan the curvature the car steers at v_slow (optionally releasing committed sides further than slow_commit)
+    and slow down to v_slow before the tight part instead of stopping (M1 / M4).
+  * checked creep and proximity guard (creep_slack, creep_chk, creep_m_obs, creep_m_wall, prox_v, prox_t): below
+    prox_v the body points along the planned path, and during a creep / soft drive-on along the steering arc, must
+    keep creep_m_obs / creep_m_wall from the measured obstacle cells / map walls, else the car stops (M4 / M6).
+  * low-speed manoeuvre = arc search (back_dist > 0 switches it on, back_after, back_max, man_*): the car has stood
+    (|v| < 0.1) for back_after s with t_stop set -> search sequences of up to 3 circular arcs of the simulator's
+    low-speed model ({forward, reverse} x steering {-1, -0.5, 0, 0.5, 1} STEER_MAX x the man_lens lengths; all 1- and
+    2-arc sequences, the man_beam best 2-arc sequences extended by one forward arc; the last arc forward).  Valid:
+    the body points every 5 cm keep man_m_wall from the map walls and man_m_obs from the remembered obstacle cells
+    (a car that starts closer may lose at most man_close).  Score: progress along the line (capped at man_goal)
+    - man_w_len length - man_w_mu |heading error| + man_w_clr min(margin, 0.1).  Per arc: stop, turn the wheels at
+    standstill, drive at man_v (reverse) / man_vf (forward), re-check the rest of the arc every call; the MPC takes
+    over after the last arc, or on a forward arc once its plan has been drivable for man_happy s (man_happy < 0:
+    only after the last arc).  A car still
+    reversing after a manoeuvre ended early (abort / timeout) is braked until it stands.  Nothing found: wait
+    back_after s and search again.  back_max limits the manoeuvres per place, not the searches (M4: infeasible
+    hairpin chicanes): n_back counts only searches that found a sequence, and is cleared once the car is more than
+    1.5 m ahead of or 3 m behind the line position of the first of them (or after a lap wrap / pose jump); with
+    n_back = back_max no search runs there any more and the car drives on only if the MPC finds a drivable plan.  A
+    failed search is not counted: it only restarts the back_after wait, so failed searches repeat every back_after s
+    with no limit while the car stands (6 in a row on harness seed 1114 o5 and emulator seed 1171 o5).
+  * heading guard (mu_max): stop when the heading error to the line exceeds mu_max (a car turning around).
+  * weave cap (a_weave, v_weave_min, weave_pre): two consecutive boxes passed on opposite sides -> reach
+    sqrt(a_weave / (4 dd / l^2)) by the end of the first box and hold it to the second (M7: weaves on the narrow
+    straight planned by the coarse DP that the car could not brake for in time).
+Options that were off in every profile were deleted on 2026-11-19 (work/advice_fix/refactor): obs_mem > 0
+(distance-based obstacle mode), vis_copy, back_ref_min, and the 'creep forbidden while blocked' mode (creep_slack >= 0
+with creep_chk <= 0); commands are bit-identical.  Frozen copy: work/advice_fix/refactor/reference/drivers.
+Behaviour changes of 2026-11-19 (work/advice_fix/behaviour; each paired against the previous state on fresh seeds,
+LiDAR-OBS on the harness with live-like timing and on the ROS-timing emulator; validation in work/advice_fix/integrate):
+  * the arc search above replaced three low-speed rules: the reverse back-off (back_v, back_k, back_grow, back_tmax,
+    back_chk, back_m_wall, back_m_obs: reverse along the steering of largest clearance, growing distance), the retry
+    with smaller corridor margins after it (tight_kw), and, in profiles/berlin_obs.json, creep (creep_after 1e9).
+    Creep (creep_after, creep_v) stays in act(): it is the time-trial profiles' only deadlock recovery (back_dist 0).
+  * a bad plan (slack > slack_bad or a failed solve) is steered by the MPC solution like every other plan.  The
+    pure-pursuit law on the DP path that used to steer it is gone; the bad flag still brakes (emergency), arms the
+    checked-creep veto and skips the proximity guard.  act() is shared, so the time-trial profiles changed too: on a
+    clear track they drive bit-identically, with obstacles or after pose jumps they do not (berlin_tt.json, 4 obstacles,
+    harness seeds 0-49, 3 laps: hits 3 -> 2 with GT, 9 -> 7 with the LiDAR wrapper; laps paired by lap index
+    -0.010 s (GT, 147 laps) / -0.021 s (LiDAR, 140 laps) per lap, median 0; in the kidnap tests with the time-trial
+    inner (seed 1, 4 obstacles, injected pose jumps) 2 of 6 runs gained an obstacle hit (one at ~4.4 m/s braking after the pose jump, one at ~0.5 m/s), baseline 0;
+    work/advice_fix/integrate, lap deltas recomputed in work/advice_fix/audit and followup: the earlier
+    '+0.05 / +0.06 s' paired laps by list position, and laps with a hit are missing from lap_times).
+  * profiles/berlin_obs.json sets fg_check false: offline every alarm of the command-following check was a false one
+    (yaw-rate channel, model error 0.36-0.58 rad/s against fg_thr_r 0.35) and its rollback stepped c_tyre.  The
+    obstacle driver no longer notices a second /drive source while it runs (run_avoid.sh refuses to start next to
+    another stack / driver node).
+  Tried and not taken: soft_em off (more stops, one hit after a manoeuvre) and the inner pose filter off (better on
+  the harness, worse on the emulator).
+Known gaps: right after a manoeuvre the MPC hand-back can touch an obstacle / wall at low speed: seen once in a
+rejected variant's run, once after an injected abort, and once with the GT obstacle driver (seed 1232 o4: an obstacle
+hit 0.66 s after a man_happy early hand-back; clean with man_happy -1).  The LiDAR obstacle driver had no hit during or
+within 3 s after a manoeuvre in 250 audit episodes (harness o4 / o5 1200-1299, emulator o5 1200-1249) and 300
+follow-up episodes (seeds 1300-1399:
+harness o4 / o5, emulator o4 / o5 on 1300-1349).  man_happy stays 0.2 (work/advice_fix/followup, paired against -1 on
+those seeds): off gave the LiDAR driver one more hit (seed 1336 o4, a wall touch during the full 3-arc sequence that the
+early hand-back had cut short) and no fewer stalls (0 / 0), the GT driver the same hits (4) and stalls (0), and made
+the laps it changed slower on average (mean +1.8 to +3.2 s per changed lap, up to +10 s; some got faster); the clear track is bit-identical.  A few
+layouts still stall after repeated failed searches (fresh seed 1046, lap 0, s 11.3); the brake after an aborted
+reverse arc never fired in a natural run (checked with injected aborts only); 50 ms command latency and pose noise
+were tested but not tuned for.
   * wall_clear_v: the wall clearance grows with speed up to 4 m/s (tracking error in tight S-bends along the walls;
     the front corner touched walls the plan cleared by a few cm).
   * min_gap_keep: hysteresis of min_gap_w for the side already chosen (a narrow gap that shrank by 3 cm at 8 m/s
@@ -136,16 +219,15 @@ import json
 import math
 import os
 import sys
+import time
 
 import numpy as np
-import osqp
 import scipy.sparse as sp
 import yaml
 from PIL import Image
 from scipy import ndimage
 from scipy.interpolate import CubicSpline
 from scipy.optimize import least_squares
-from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 MAPDIR = os.path.expanduser('~/forza_ws/race_stack/stack_master/maps/hyhall12')
@@ -163,65 +245,18 @@ BOX_FRONT = 0.435      # referee box front, ahead of the CG
 ANG_MIN = -2.35
 ANG_INC = 4.7 / 1079
 K_US0 = 0.002787
+# body points (CG frame, m) checked against the measured obstacle cells / map walls: the referee box (LiDAR +- 0.165 m
+# along, +- 0.1016 m across, i.e. CG + 0.105 .. 0.435) densely, the rest of the car more coarsely
+BODY_PTS = ((-0.30, 0.12), (-0.30, -0.12), (-0.30, 0.0), (-0.15, 0.12), (-0.15, -0.12), (0.0, 0.12), (0.0, -0.12),
+            (0.105, 0.11), (0.105, -0.11), (0.2, 0.11), (0.2, -0.11), (0.3, 0.11), (0.3, -0.11), (BOX_FRONT, 0.11),
+            (BOX_FRONT, -0.11), (BOX_FRONT, 0.0))
+FRONT_PTS = tuple(p for p in BODY_PTS if p[0] >= 0.0)
 
 
 def k_us(a, c=1.0):
     """understeer gradient under longitudinal acceleration a (load transfer); c scales the tyre stiffness"""
     a = np.minimum(np.maximum(a, -A_MAX), A_MAX)
     return (LR_ / (MU_ * CSF_ * (G_ * LR_ - a * HCG_)) - LF_ / (MU_ * CSR_ * (G_ * LF_ + a * HCG_))) / c
-
-
-def bicycle_s(v, a, c=1.0):
-    """scalar version of bicycle()"""
-    a = -A_MAX if a < -A_MAX else (A_MAX if a > A_MAX else a)
-    cf = c * MU_ * CSF_ * (G_ * LR_ - a * HCG_)
-    cr = c * MU_ * CSR_ * (G_ * LF_ + a * HCG_)
-    vl = v * WB
-    return (-(cr + cf) / vl, (cr * LR_ - cf * LF_) / (v * vl) - 1.0, cf / vl,
-            M_ * (cr * LR_ - cf * LF_) / (I_ * WB), -M_ * (LF_ * LF_ * cf + LR_ * LR_ * cr) / (v * I_ * WB),
-            M_ * LF_ * cf / (I_ * WB))
-
-
-def bicycle(v, a, c=1.0):
-    """linear single-track coefficients: beta' = a11 b + a12 r + b1 delta ; r' = a21 b + a22 r + b2 delta.
-    c scales the cornering stiffness of both axles (mu * C_S of the linear tyre: friction and stiffness act alike)"""
-    a = np.minimum(np.maximum(a, -A_MAX), A_MAX)
-    cf = c * MU_ * CSF_ * (G_ * LR_ - a * HCG_)
-    cr = c * MU_ * CSR_ * (G_ * LF_ + a * HCG_)
-    a11 = -(cr + cf) / (v * WB)
-    a12 = (cr * LR_ - cf * LF_) / (v * v * WB) - 1.0
-    b1 = cf / (v * WB)
-    a21 = M_ * (cr * LR_ - cf * LF_) / (I_ * WB)
-    a22 = -M_ * (LF_ * LF_ * cf + LR_ * LR_ * cr) / (v * I_ * WB)
-    b2 = M_ * LF_ * cf / (I_ * WB)
-    return a11, a12, b1, a21, a22, b2
-
-
-def p_accel(v_cmd, v):
-    """the simulator's speed P-controller + acceleration constraints"""
-    dv = v_cmd - v
-    if v > 0.0:
-        a = (KP_ACC if dv > 0 else KP_BRK) * dv
-    else:
-        a = (2.0 * 9.51 / 20.0 if dv > 0 else 2.0 * 9.51 / 5.0) * dv
-    pos = A_MAX * V_SWITCH / v if v > V_SWITCH else A_MAX
-    return max(-A_MAX, min(pos, a))
-
-
-def expm_batch(M):
-    """matrix exponential of a batch (n, k, k) by scaling and squaring + Taylor(10)"""
-    nrm = np.max(np.sum(np.abs(M), axis=2))
-    s = max(0, int(math.ceil(math.log2(max(nrm, 1e-12)))) + 1)
-    A = M / (2.0 ** s)
-    k = M.shape[1]
-    E = np.broadcast_to(np.eye(k), M.shape).copy()
-    T = E.copy()
-    for j in range(1, 11):
-        T = T @ A / j
-        E = E + T
-    for _ in range(s):
-        E = E @ E
-    return E
 
 
 def _wrap(a):
@@ -290,9 +325,8 @@ def _dp_core(cost0, node_cost, blocked, kv, cst, cv_cost, sl_cost, dlo, dhi, w_g
 
 
 @njit(cache=True)
-def _passes(vlim, dpl, tab_plan, v0, a_acc, ka, a_lat, gg, gg_min):
-    """backward pass with the speed dependent (steerable) deceleration; with gg > 0 the deceleration shrinks with
-    the lateral usage (v^2 kappa / a_lat) of the station (brake before the corner, not in it)"""
+def _passes(vlim, dpl, tab_plan):
+    """backward pass with the speed dependent (steerable) deceleration"""
     N1 = vlim.shape[0]
     v = vlim.copy()
     nt = tab_plan.shape[0]
@@ -301,13 +335,6 @@ def _passes(vlim, dpl, tab_plan, v0, a_acc, ka, a_lat, gg, gg_min):
         ab = tab_plan[min(int(vn * 20.0), nt - 1)]
         g1 = math.sqrt(vn * vn + 2.0 * ab * dpl[i])
         ab = tab_plan[min(int(g1 * 20.0), nt - 1)]
-        if gg > 0.0:
-            kk = ka[i] if ka[i] > ka[i + 1] else ka[i + 1]
-            u = vn * vn * kk / a_lat
-            f = 1.0 - gg * u * u
-            if f < gg_min:
-                f = gg_min
-            ab = ab * math.sqrt(f)
         g1 = math.sqrt(vn * vn + 2.0 * ab * dpl[i])
         if g1 < v[i]:
             v[i] = g1
@@ -331,28 +358,6 @@ def _fwd(v, dpl, v0, a_acc, tab_emerg):
             ab = tab_emerg[min(int(max(vb, 0.0) * 20.0), nt - 1)]
             vb = math.sqrt(max(vb * vb - 2.0 * ab * dpl[i], 0.0))
     return vf, vpred
-
-
-@njit(cache=True)
-def _stable_accel_k(vpred, dpl, te, a_acc):
-    v = vpred.copy()
-    nt = te.shape[0]
-    n = dpl.shape[0]
-    acc = np.empty(n)
-    for i in range(n):
-        x = v[i] if v[i] > 0.0 else 0.0
-        ab = te[min(int(x * 20.0), nt - 1)]
-        vm = v[i] * v[i] - 2.0 * ab * dpl[i]
-        vmin = math.sqrt(vm) if vm > 0.0 else 0.0
-        if v[i + 1] < vmin:
-            v[i + 1] = vmin
-        a = (v[i + 1] * v[i + 1] - v[i] * v[i]) / (2.0 * dpl[i])
-        if a < -ab:
-            a = -ab
-        if a > a_acc:
-            a = a_acc
-        acc[i] = a
-    return v, acc
 
 
 @njit(cache=True)
@@ -465,61 +470,9 @@ def _cluster_k(xs, ys, link):
 
 
 @njit(cache=True)
-def _expm_k(M):
-    """batched matrix exponential (scaling and squaring + Taylor 10) for small square matrices"""
-    nb, k, _ = M.shape
-    out = np.empty_like(M)
-    A = np.empty((k, k))
-    T = np.empty((k, k))
-    T2 = np.empty((k, k))
-    E = np.empty((k, k))
-    for b in range(nb):
-        nrm = 0.0
-        for i in range(k):
-            ssum = 0.0
-            for j in range(k):
-                ssum += abs(M[b, i, j])
-            if ssum > nrm:
-                nrm = ssum
-        s = 0
-        if nrm > 0.5:
-            s = int(math.ceil(math.log(nrm / 0.5) / math.log(2.0)))
-        sc = 1.0 / (2.0 ** s)
-        for i in range(k):
-            for j in range(k):
-                A[i, j] = M[b, i, j] * sc
-                T[i, j] = A[i, j]
-                E[i, j] = A[i, j] + (1.0 if i == j else 0.0)
-        for p in range(2, 11):
-            for i in range(k):
-                for j in range(k):
-                    acc = 0.0
-                    for q in range(k):
-                        acc += T[i, q] * A[q, j]
-                    T2[i, j] = acc / p
-            for i in range(k):
-                for j in range(k):
-                    T[i, j] = T2[i, j]
-                    E[i, j] += T2[i, j]
-        for _ in range(s):
-            for i in range(k):
-                for j in range(k):
-                    acc = 0.0
-                    for q in range(k):
-                        acc += E[i, q] * E[q, j]
-                    T2[i, j] = acc
-            for i in range(k):
-                for j in range(k):
-                    E[i, j] = T2[i, j]
-        for i in range(k):
-            for j in range(k):
-                out[b, i, j] = E[i, j]
-    return out
-
-
-@njit(cache=True)
 def _expm_fr_k(M):
-    """_expm_k for the augmented Frenet single-track Jacobian of _mpc_hp_k (bitwise the same result): rows 5, 6
+    """batched matrix exponential (scaling and squaring + Taylor 10) of the augmented Frenet single-track Jacobian of
+    _mpc_hp_k (bitwise the same result as the generic _expm_k of the reference copy): rows 5, 6
     (input, affine term) are zero, so they stay identity rows, and of rows 0..4 only these entries are nonzero:
     (0,1) (0,2) (0,6) (1,0) (1,1) (1,2) (1,3) (1,6) (2,2) (2,3) (2,4) (3,2) (3,3) (3,4) (4,5).  The products skip
     only exact-zero terms and keep the summation order, ~4x fewer flops."""
@@ -1590,12 +1543,12 @@ def _wrap1(a):
 
 
 @njit(cache=True)
-def _speed_k(st, d, mu, beta, kr, v0, scan, lx, ly, yaw, s_block, kyaw, fx, fy, fnx, fny, fpsi, fvx, L, fds,
-             ds, v_max, a_lat, v_end_scale, swerve_w, a_acc, gg, gg_min, a_acc_eff, vis_tol, vis_start, m_vis, m_blk,
-             t_react, v_vis_safe, tab_plan, tab_emerg, tab_dstop, tab_v):
-    """CorridorMPC._speed_profile (without vis_obs_stop) in one compiled pass, same formulas and order.
-    s_block: nan when there is none; kyaw: empty when unused.  Returns vprof, vpred, acc, dpl, k_vis (-1: all
-    visible), v[0] of the limited profile."""
+def _speed_k(st, d, mu, beta, kr, v0, scan, lx, ly, yaw, s_block, fx, fy, fnx, fny, fpsi, fvx, L, fds, ds, v_max,
+             a_lat, v_end_scale, a_acc, vis_tol, vis_start, m_vis, m_blk, t_react, v_vis_safe, tab_plan, tab_emerg,
+             tab_dstop, tab_v):
+    """speed profile on the MPC path in one compiled pass: lateral-acceleration limit, backward pass with the
+    steerable deceleration, emergency envelope (sight / closed corridor), forward pass.  s_block: nan when there is
+    none.  Returns vprof, vpred, acc, dpl, k_vis (-1: all visible), v[0] of the limited profile, cum."""
     N1 = st.shape[0]
     N = N1 - 1
     nf = fx.shape[0]
@@ -1630,10 +1583,6 @@ def _speed_k(st, d, mu, beta, kr, v0, scan, lx, ly, yaw, s_block, kyaw, fx, fy, 
     ka0 = np.empty(N1)
     for i in range(N1):
         ka0[i] = abs(kg[i])
-        if swerve_w > 0.0:
-            ka0[i] = ka0[i] + swerve_w * abs(kg[i] - kr[i])
-        if kyaw.shape[0] > 0:
-            ka0[i] = max(ka0[i], kyaw[i])
     ka = np.empty(N1)
     vlim = np.empty(N1)
     for i in range(N1):
@@ -1647,7 +1596,7 @@ def _speed_k(st, d, mu, beta, kr, v0, scan, lx, ly, yaw, s_block, kyaw, fx, fy, 
     vx_end = fvx[i0] * (1 - f) + fvx[(i0 + 1) % nf] * f
     v_end = min(v_max, vx_end * math.sqrt(a_lat / 12.0) * v_end_scale)
     vlim[N] = min(vlim[N], v_end)
-    v = _passes(vlim, dpl, tab_plan, v0, a_acc, ka, a_lat, gg, gg_min)
+    v = _passes(vlim, dpl, tab_plan)
     # emergency envelope: stop before unseen path / closed corridor
     kv = -1
     for i in range(N1):
@@ -1699,7 +1648,7 @@ def _speed_k(st, d, mu, beta, kr, v0, scan, lx, ly, yaw, s_block, kyaw, fx, fy, 
                 if reach <= 0:
                     e = 0.0
             v[i] = min(v[i], e)
-    vprof, vpred = _fwd(v, dpl, v0, a_acc_eff, tab_emerg)
+    vprof, vpred = _fwd(v, dpl, v0, a_acc, tab_emerg)
     acc = np.empty(N)
     for i in range(N):
         a = (vpred[i + 1] * vpred[i + 1] - vpred[i] * vpred[i]) / (2 * dpl[i])
@@ -1789,10 +1738,6 @@ class _Hpipm:
             f = getattr(lib, 'd_ocp_qp_set_' + nm)
             f.argtypes = [ip, vp, vp]
             f.restype = None
-        for nm in ('x', 'u', 'sl', 'su'):
-            f = getattr(lib, 'd_ocp_qp_sol_get_' + nm)
-            f.argtypes = [ip, vp, vp]
-            f.restype = None
         lib.d_ocp_qp_ipm_solve.argtypes = [vp, vp, vp, vp]
         lib.d_ocp_qp_ipm_get_status.argtypes = [vp, vp]
         lib.d_ocp_qp_ipm_get_iter.argtypes = [vp, vp]
@@ -1827,10 +1772,6 @@ class _Hpipm:
                 lib.d_ocp_qp_set_D(k, Dk.ctypes.data, self.qp)
         self.status = C.c_int(0)
         self.iters = C.c_int(0)
-        self.out_x = np.zeros((N + 1, nx[0]))
-        self.out_u = np.zeros((N, max(nu)))
-        self.out_sl = np.zeros((N + 1, max(max(ns), 1)))
-        self.out_su = np.zeros((N + 1, max(max(ns), 1)))
 
     def setup_all(self, nbx, nbu, idxbx, idxbu, idxs, Zl, zl, R):
         """persistent buffers + pointer arrays for d_ocp_qp_set_all / d_ocp_qp_sol_get_all (one C call each)"""
@@ -1903,71 +1844,92 @@ class _Hpipm:
         lib.d_ocp_qp_sol_get_all(self.sol, *self.p_sol)
         return self.status.value, self.iters.value, self.sx.copy()
 
-    def solve(self, A, B, b, Q, q, Cm, lg, ug, x0, lbx, ubx, lbu, ubu):
-        """A (N,nx,nx) B (N,nx,nu) b (N,nx) Q (N+1,nx,nx) q (N+1,nx) Cm (N+1,ng,nx) lg/ug (N+1,ng); x0 fixed at
-        stage 0 through lbx/ubx of stage 0; lbx/ubx (N+1, nbx) for later stages, lbu/ubu (N, nbu)"""
-        lib, qp, N = self.lib, self.qp, self.N
-        At = np.ascontiguousarray(np.transpose(A, (0, 2, 1)))           # column-major blocks
-        Bt = np.ascontiguousarray(np.transpose(B, (0, 2, 1)))
-        Qt = np.ascontiguousarray(np.transpose(Q, (0, 2, 1)))
-        Ct = np.ascontiguousarray(np.transpose(Cm, (0, 2, 1)))
-        b = np.ascontiguousarray(b)
-        q = np.ascontiguousarray(q)
-        lg = np.ascontiguousarray(lg)
-        ug = np.ascontiguousarray(ug)
-        lbx = np.ascontiguousarray(lbx)
-        ubx = np.ascontiguousarray(ubx)
-        lbu = np.ascontiguousarray(lbu)
-        ubu = np.ascontiguousarray(ubu)
-        x0 = np.ascontiguousarray(x0, dtype=float)
-        pA, pB, pQ, pC = At.ctypes.data, Bt.ctypes.data, Qt.ctypes.data, Ct.ctypes.data
-        pb, pq, plg, pug = b.ctypes.data, q.ctypes.data, lg.ctypes.data, ug.ctypes.data
-        plx, pux, plu, puu = lbx.ctypes.data, ubx.ctypes.data, lbu.ctypes.data, ubu.ctypes.data
-        sA, sB, sQ, sC = At.strides[0], Bt.strides[0], Qt.strides[0], Ct.strides[0]
-        sb, sq, sg, sx, su = b.strides[0], q.strides[0], lg.strides[0], lbx.strides[0], lbu.strides[0]
-        for k in range(N + 1):
-            if k < N:
-                lib.d_ocp_qp_set_A(k, pA + k * sA, qp)
-                lib.d_ocp_qp_set_B(k, pB + k * sB, qp)
-                lib.d_ocp_qp_set_b(k, pb + k * sb, qp)
-                lib.d_ocp_qp_set_lbu(k, plu + k * su, qp)
-                lib.d_ocp_qp_set_ubu(k, puu + k * su, qp)
-            lib.d_ocp_qp_set_Q(k, pQ + k * sQ, qp)
-            lib.d_ocp_qp_set_q(k, pq + k * sq, qp)
-            if k == 0:
-                lib.d_ocp_qp_set_lbx(0, x0.ctypes.data, qp)
-                lib.d_ocp_qp_set_ubx(0, x0.ctypes.data, qp)
-            else:
-                lib.d_ocp_qp_set_lbx(k, plx + k * sx, qp)
-                lib.d_ocp_qp_set_ubx(k, pux + k * sx, qp)
-            if self.ng[k]:
-                lib.d_ocp_qp_set_C(k, pC + k * sC, qp)
-                lib.d_ocp_qp_set_lg(k, plg + k * sg, qp)
-                lib.d_ocp_qp_set_ug(k, pug + k * sg, qp)
-        lib.d_ocp_qp_ipm_solve(qp, self.sol, self.arg, self.ws)
-        C = self.C
-        lib.d_ocp_qp_ipm_get_status(self.ws, C.addressof(self.status))
-        lib.d_ocp_qp_ipm_get_iter(self.ws, C.addressof(self.iters))
-        X = self.out_x
-        px, sxx = X.ctypes.data, X.strides[0]
-        get_x, sol = lib.d_ocp_qp_sol_get_x, self.sol
-        for k in range(N + 1):
-            get_x(k, sol, px + k * sxx)
-        return self.status.value, self.iters.value, X.copy()
+
+# obstacle options (berlin_obs.json), all off by default (see the module docstring)
+EXTRA = dict(
+    # obstacle mode (obs_kw: parameter overrides while the mode is on, scalars read per call only)
+    obs_mem=0.0,            # 0: the mode is always on (obs_kw always applied); < 0: per lap: on in the first lap, in
+                            # every lap after a lap with a box, and from the first box of a lap on (a clear track is
+                            # driven with the base parameters)
+    obs_kw=None,
+    # horizon-frontier envelope (obstacle mode): whatever lies beyond the planning horizon is unknown -> be able to
+    # reach v_hz at the horizon end (path length cum[N]) minus BOX_FRONT + m_hz with the emergency deceleration,
+    # t_lag seconds of command lag included.  v_hz < 0: off
+    v_hz=-1.0, m_hz=0.15, t_lag=0.0,
+    # w_front > 0: the frontier envelope only where the track (free width from the map along the line normals) is
+    # narrower than w_front within [horizon end - 0.5, horizon end + hz_look]; a static speed cap (the envelope's value
+    # for a straight 8 m horizon, ramped with front_ramp m/s^2) prepares for it.  Wide sections need no stop for an
+    # obstacle appearing at the horizon end: every single obstacle or chicane there can be passed by a swerve
+    w_front=0.0, hz_look=2.5, front_ramp=3.0,
+    # em_frac < 1: the closed-corridor stop envelope (s_block) again with em_frac of the emergency deceleration (a car
+    # that finds itself above it can get back under it)
+    em_frac=1.0,
+    # DP: a side of a box whose corridor (box .. wall, after margins) is narrower than g_narrow while the other side
+    # is wider by g_diff is closed for the DP (the wide side is taken early instead of the narrow one).  <0: off
+    g_narrow=-1.0, g_diff=0.25,
+    # creep / soft emergency guard: the plan is 'blocked' while it needs more than creep_slack of corridor slack within
+    # creep_dist of path (back-off trigger, checked creep).  <0: off
+    creep_slack=-1.0, creep_dist=0.8,
+    # checked creep (creep_chk > 0, required with creep_slack >= 0): the creep / soft drive-on of a blocked plan is
+    # allowed while the body (front / middle / rear corners) moved creep_chk m along the kinematic arc of the commanded
+    # steering keeps creep_m_obs from the remembered obstacle cells (measured surface points, not the padded boxes)
+    # and creep_m_wall from the map walls; otherwise the car stops (and may back off)
+    creep_chk=0.0, creep_m_obs=0.04, creep_m_wall=0.03,
+    # proximity guard (prox_v > 0): below prox_v m/s the planned path of the next max(creep_chk, prox_t v) m must keep
+    # the body creep_m_obs from the measured obstacle cells and creep_m_wall from the walls, else the car stops (the
+    # 3-point corridor of the MPC misses the box corners at large heading angles next to an obstacle corner)
+    prox_v=0.0, prox_t=0.4,
+    # heading guard (mu_max > 0): heading error to the line above mu_max rad in obstacle mode -> stop (the Frenet MPC
+    # linearisation breaks down; a full-lock swerve once turned the car around); with back_dist > 0 the arc search
+    # runs once the car has stood back_after s (its score charges the heading error, man_w_mu)
+    mu_max=0.0,
+    # weave cap (a_weave > 0): for two consecutive boxes passed on opposite sides, the S between them needs the
+    # curvature 4 dd / l^2 (dd: lateral change of the body line, l: free length between the boxes); reach
+    # sqrt(a_weave / kappa) (>= v_weave_min) by the end of the first box (planned from the boxes and DP sides, not
+    # from the MPC path: the MPC assumes the braking the car then lags)
+    a_weave=0.0, v_weave_min=1.0, weave_pre=0.3,
+    # slow DP: when the DP finds no complete path, plan again with the curvature the car can steer at v_slow (DP
+    # curvature cap kcap_slow, braking dp_adec_slow from now) before falling back to narrow gaps / a stop; the speed
+    # profile then reaches v_slow at s_block_normal - slow_pre and keeps it for slow_len m.  v_slow < 0: off
+    v_slow=-1.0, kcap_slow=1.1, kmax_slow=6, dp_adec_slow=5.0, slow_pre=2.0, slow_len=4.0, m_slow=0.1,
+    slow_commit=None,       # [commit_d, commit_t] of a second slow-DP try that may release committed sides
+    a_lat_slow=0.0,         # > 0: lateral acceleration of the slow DP's curvature limit (truly slow manoeuvres)
+    # low-speed manoeuvre (arc search, see the module docstring): back_dist > 0 switches it on (the value itself is
+    # not used); a search after the car has stood back_after s.  back_max = manoeuvres (successful searches) per
+    # place; a failed search is not counted and is repeated every back_after s with no limit
+    back_dist=0.0, back_after=1.0, back_max=3,
+    man_v=0.3, man_vf=0.45,     # reverse / forward speed (m/s; < 0.5: the simulator's kinematic regime)
+    man_lens=(0.35, 0.7, 1.2),  # arc lengths (m)
+    man_m_wall=0.04, man_m_obs=0.06,
+    man_tol=0.015,              # re-check while driving: clearance may fall this much below the search's floor
+    man_goal=2.5,               # progress (m along the line) beyond which more is not rewarded
+    man_w_len=0.1, man_w_mu=0.3, man_w_clr=1.0,
+    man_beam=40,
+    man_min_prog=0.05,          # a sequence must gain at least this much progress
+    man_happy=0.2,              # early hand-back once the MPC plan was drivable this long (s) on a forward arc, < 0 off
+    man_close=0.02,             # a car that starts closer than the margins may lose this much clearance (floor >= this)
+)
+
+
+# kwargs deleted on 2026-11-19 (options off in every profile, and the back-off / tight retry that the arc search
+# replaced; see the module docstring): a clear error instead of 'unknown'
+REMOVED = ('a_lat_fb', 'gain_comp', 'yaw_lim', 'gg', 'gg_min', 'swerve_w', 'a_acc_launch', 'v_launch', 'escape',
+           'vis_obs_stop', 'box_mono', 'occl_ext', 'occl_fix', 'debug', 'jit', 'solver', 'hp_all', 'acc_model',
+           'shift_ws', 'osqp_eps', 'osqp_iter', 'osqp_rho_int', 'osqp_rho', 'osqp_tlim', 'vis_copy', 'back_ref_min',
+           'back_grow', 'back_v', 'back_k', 'back_tmax', 'back_chk', 'back_m_wall', 'back_m_obs', 'tight_kw')
 
 
 class CorridorMPC:
     def __init__(self, **kw):
         p = dict(
             # speed
-            v_max=8.5, a_lat=7.5, a_lat_hard=7.5, a_acc=6.0, a_dec=9.0, c_plan=0.6, c_emerg=0.3, a_lat_fb=99.0,
-            acc_corner_min=1.0, gain_comp=False,
+            v_max=8.5, a_lat=7.5, a_lat_hard=7.5, a_acc=6.0, a_dec=9.0, c_plan=0.6, c_emerg=0.3,
+            acc_corner_min=1.0,
             m_vis=0.15, m_blk=0.30, jerk=60.0, v_min_plan=0.8, vis_tol=0.12, vis_start=0.6,
             t_react=0.04, v_end_scale=1.0,
             # geometry / margins
             m_hard=0.04, m_hard_v=0.006, c_pref=0.12, wall_clear=0.16, wall_clear_v=0.02, wall_clear_vmax=4.0, wall_pref=0.28,
-            obs_pad_s=0.06, obs_pad_d=0.02, hidden_depth=0.43, min_width=0.30, w_max=0.43, occl_ext=True, occl_fix=True,
-            box_mono=False,
+            obs_pad_s=0.06, obs_pad_d=0.02, hidden_depth=0.43, min_width=0.30, w_max=0.43,
             # perception
             obs_edt=0.09, r_max=9.0, link=0.22, blind_after_wrap=0.07, carve=True,
             # DP
@@ -1976,13 +1938,12 @@ class CorridorMPC:
             w_soft=40.0, w_wall=10.0,
             p_flip=3.0, p_flip_hard=40.0, commit_t=0.45, commit_d=1.0, commit_ramp=1.5, young_t=0.15,
             dp_kgeo=0.95, w_geo=10.0,
-            cluster_ds=3.0, release_margin=0.0, hard_block_v=1.5, min_gap_w=0.06, min_gap_keep=0.0, escape=False, gap_fallback=True,
+            cluster_ds=3.0, release_margin=0.0, hard_block_v=1.5, min_gap_w=0.06, min_gap_keep=0.0, gap_fallback=True,
             # MPC
             q_d=2.0, q_mu=0.05, q_a=0.02, r_w=0.02, rho1=200.0, rho2=2000.0, rhoa1=50.0, rhoa2=50.0,
             slack_brake=0.03, lpts=(0.0, 0.22, 0.435), slack_near=20.0, slack_len=1.5, slack_reach=2.0,
             slack_bad=0.15,
-            osqp_eps=1e-3, osqp_iter=250, osqp_rho_int=25, osqp_rho=0.1, osqp_tlim=0.006, shift_ws=False,
-            solver='hpipm', hp_iter=30, hp_all=True, split=True, hp_tol=(1e-4, 1e-5, 1e-5, 1e-5), hp_mode=1, reuse_prof=True, ref_dp=True,
+            hp_iter=30, split=True, hp_tol=(1e-4, 1e-5, 1e-5, 1e-5), hp_mode=1, reuse_prof=True, ref_dp=True,
             # estimation / timing
             k_obs=0.5, t_lat=0.03, t_buf=0.02, creep_after=1.0, creep_v=0.6,
             # online latency estimate (t_lat is only the prior): candidates lat_min..lat_max in 10 ms steps
@@ -1996,8 +1957,7 @@ class CorridorMPC:
             q_r=0.03 ** 2, beta_sig=0.02, pose_gate=0.3,
             c_adapt=True, c_grid=(0.6, 1.4, 9), c_tau=3.0, c_prior=1.0, c_vmin=2.0, l_grid=(-0.02, 0.05, 8),
             l_prior=100.0, c_tables=True,
-            acc_model=True, t_call=0.02, em_jerk=400.0, yaw_lim=0.0, gg=0.0, gg_min=0.25, v_vis_safe=2.5, swerve_w=0.0, a_acc_launch=0.0, v_launch=3.0, resolve_da=2.0, resolve_n=10, vis_obs_stop=False,
-            debug=False,
+            t_call=0.02, em_jerk=400.0, v_vis_safe=2.5, resolve_da=2.0, resolve_n=10,
             # FIXUP (2026-11-12): soft emergency at low speed (slack-only emergency with slack <= soft_em becomes a
             # soft_em_v speed cap once vv <= soft_em_arm); lat_est switch rule relative to the cost above the speed-noise
             # floor; adaptive estimators gated on 'the car follows the commands' (fg_win s open-loop check, rollback);
@@ -2007,7 +1967,6 @@ class CorridorMPC:
             pose_out=4.0, pose_out_floor=0.03, yaw_out_floor=0.02,
             stall_db=0.1, stall_min=0.85,
             line_ktrig=0.9, line_kmax=1.0, line_dkmax=2.0, line_clr=0.35, line_wdev=0.001,
-            jit=True,              # compiled (numba) kernels for the per-call numerics; False: the numpy reference code
             map_name='hyhall12',   # any stack_master/maps/<name> with global_waypoints.json
             # reference line shipped with the driver (json: arrays s, x, y[, vx] or a wpnts list / map-style file);
             # None: the map raceline.  Relative paths are resolved against the avoid/ directory.
@@ -2015,26 +1974,28 @@ class CorridorMPC:
             # delay-adaptive a_lat: [t0, t1, a1] (see header); None = v2
             lat_alat=None,
         )
+        p.update(EXTRA)
         for k, v in kw.items():
+            if k in REMOVED:
+                raise KeyError(f'parameter {k} was removed on 2026-11-19 (see the module docstring; last version '
+                               f'with it: work/advice_fix/refactor/reference/drivers)')
             if k not in p:
                 raise KeyError(f'unknown parameter {k}')
             p[k] = v
         self.p = p
         for k, v in p.items():
             setattr(self, k, v)
+        if self.obs_mem > 0.0:
+            raise ValueError('obs_mem > 0 (distance-based obstacle mode) was removed: use 0 (always on) or < 0 (per lap)')
+        if self.creep_slack >= 0.0 and self.creep_chk <= 0.0:
+            raise ValueError('creep_slack >= 0 needs creep_chk > 0 (the unchecked creep-forbidden mode was removed)')
         self.lpts = tuple(self.lpts)
         self.wc_eff = self.wall_clear
         self.mapdir = os.path.join(os.path.dirname(MAPDIR), self.map_name)
         self._load_occ()
         self._load_track()
         self._load_map()
-        self._build_qp()
-        self.hp = None
-        if self.solver == 'hpipm':
-            try:
-                self.hp = self._build_hpipm()
-            except Exception:          # library not available: fall back to OSQP (same QP, slower)
-                self.hp = None
+        self.hp = self._build_hpipm()        # HPIPM of the CasADi install (the OSQP fallback was removed)
         ang = ANG_MIN + ANG_INC * np.arange(1080)
         self.ca, self.sa = np.cos(ang), np.sin(ang)
         _hits_k(np.ones(1080), 0.0, 0.0, 1.0, 0.0, self.ca, self.sa, 9.0, self.ox, self.oy, self.res, self.W, self.H,
@@ -2064,13 +2025,11 @@ class CorridorMPC:
         for ok_ in (np.ones(2, dtype=np.bool_), np.zeros(2, dtype=np.bool_)):
             _boxes_k(np.array([0, 1]), ok_, z32, z32, z32, z32, z32, z32, np.array([5, 1079]), np.ones(1080), self.MW,
                      self.W, 0.0, float(self.L), 9.0, 0.22)
-        _passes(np.ones(3), np.ones(2), self.tab_plan, 1.0, 1.0, np.zeros(3), 7.0, 0.0, 0.2)
+        _passes(np.ones(3), np.ones(2), self.tab_plan)
         _fwd(np.ones(3), np.ones(2), 1.0, 1.0, self.tab_plan)
-        _stable_accel_k(np.ones(3), np.ones(2), self.tab_plan, 1.0)
         _cluster_k(np.zeros(3), np.zeros(3), 0.1)
         _cmd_sim(np.ones(3), np.arange(3.0), np.ones(2), 1.0, 0.0, 1.0, 1.0, self.tab_emerg, 0.02)
         _lat_sim_k(np.zeros(2), np.ones(2), np.array([0.0, 0.03]), np.ones(2), 0.0, 2)
-        _expm_k(np.zeros((2, 7, 7)))
         _expm_fr_k(np.zeros((2, 7, 7)))
         # latency hypotheses and their forgotten innovation sums; kept over reset() (a property of the system)
         self.lat_c = np.round(np.arange(self.lat_min, self.lat_max + 1e-9, 0.01), 3)
@@ -2097,17 +2056,15 @@ class CorridorMPC:
                   self.wlo_c, self.whi_c, self.wlo_p, self.whi_p, float(self.fds), 1.8, 1.0, 10.0, bxw,
                   np.ones(nb_, dtype=np.int64), np.ones(nb_), np.zeros(nb_, dtype=np.bool_), 0.2, 0.6, 30.0, 0.12,
                   40.0, True, 0.06, 4.0, 6.0, 2.0, 7.5, 0.8, 20.0, 2.0, 1.0, 0.0, self.fk, float(self.L), 0.95, 10.0)
-        if self.hp is not None:
-            st0 = np.arange(self.n + 1) * self.ds
-            z1, zn = np.zeros(self.n + 1), np.zeros(self.n)
-            hp = self.hp
-            _mpc_hp_k(st0, np.zeros(5), np.zeros((self.n + 1, 5)), z1, z1 + 1.0, zn, zn + self.ds, z1, self.lpts_a,
-                      self.wlo_c, self.whi_c, self.nf, self.fds, np.zeros((1, 4)), np.ones(1, dtype=np.int64), 0.1,
-                      0.8, 0.1, 1.0, 1.0, 1.0, 1.0, self.tab_plan, hp.bA, hp.bB, hp.bb, hp.bQ, hp.bq, hp.bC, hp.blg,
-                      hp.bug, hp.blbx, hp.bubx, np.zeros((self.n, 3)), np.zeros((self.n, 3)), np.zeros((self.n, 3)),
-                      np.zeros(self.n), 1.0)
-            _hp_slack_k(np.zeros((self.n + 1, 5)), np.zeros((self.n, 3)), np.zeros((self.n, 3)), np.zeros((self.n, 3)))
-        self._no_kyaw = np.zeros(0)
+        st0 = np.arange(self.n + 1) * self.ds
+        z1, zn = np.zeros(self.n + 1), np.zeros(self.n)
+        hp = self.hp
+        _mpc_hp_k(st0, np.zeros(5), np.zeros((self.n + 1, 5)), z1, z1 + 1.0, zn, zn + self.ds, z1, self.lpts_a,
+                  self.wlo_c, self.whi_c, self.nf, self.fds, np.zeros((1, 4)), np.ones(1, dtype=np.int64), 0.1,
+                  0.8, 0.1, 1.0, 1.0, 1.0, 1.0, self.tab_plan, hp.bA, hp.bB, hp.bb, hp.bQ, hp.bq, hp.bC, hp.blg,
+                  hp.bug, hp.blbx, hp.bubx, np.zeros((self.n, 3)), np.zeros((self.n, 3)), np.zeros((self.n, 3)),
+                  np.zeros(self.n), 1.0)
+        _hp_slack_k(np.zeros((self.n + 1, 5)), np.zeros((self.n, 3)), np.zeros((self.n, 3)), np.zeros((self.n, 3)))
         stw = np.arange(self.n + 1) * self.ds
         _plan_prep_k(stw, self.fk, float(self.L), float(self.fds), stw, np.zeros((self.n + 1, 5)), stw * 0.0,
                      np.zeros(5), stw, stw[:-1] * 0.0 + self.ds, stw * 0.0 + 1.0, 1.0, 0.0, 6.0, 60.0,
@@ -2115,10 +2072,25 @@ class CorridorMPC:
         z1 = np.zeros(self.n + 1)
         for sblk in (math.nan, 1.0):
             _speed_k(np.arange(self.n + 1) * self.ds, z1, z1, z1, z1, 1.0, np.ones(1080), 0.0, 0.0, 0.0, sblk,
-                     self._no_kyaw, self.fx, self.fy, self.fnx, self.fny, self.fpsi, self.fvx, float(self.L),
-                     float(self.fds), 0.2, 8.0, 7.0, 1.0, 0.0, 6.0, 0.0, 0.2, 6.0, 0.1, 0.5, 0.1, 0.1, 0.04, 2.5,
-                     self.tab_plan, self.tab_emerg, self.tab_dstop, self.tab_v)
+                     self.fx, self.fy, self.fnx, self.fny, self.fpsi, self.fvx, float(self.L), float(self.fds), 0.2,
+                     8.0, 7.0, 1.0, 6.0, 0.1, 0.5, 0.1, 0.1, 0.04, 2.5, self.tab_plan, self.tab_emerg, self.tab_dstop,
+                     self.tab_v)
         self.reset()
+        # obstacle mode: obs_kw overrides (validated; EXTRA options cannot be switched), frontier tables
+        self.obs_kw = dict(self.obs_kw or {})
+        for k in self.obs_kw:
+            if k not in self.p or k in EXTRA:
+                raise KeyError(f'obs_kw: unknown or non-switchable parameter {k}')
+        self.base_kw = {k: self.p[k] for k in self.obs_kw}
+        self.obs_on = None
+        self._set_mode(True)
+        self._front_tables()
+        # arc search: body points and the 30 primitives (direction, steering, length)
+        bp = np.array(BODY_PTS, dtype=float)
+        self._bpx, self._bpy = bp[:, 0], bp[:, 1]
+        st = np.array([-1.0, -0.5, 0.0, 0.5, 1.0]) * STEER_MAX
+        self._prims = np.array([(dr, dl, ln) for dr in (1.0, -1.0) for dl in st for ln in self.man_lens])
+        self.man_stats = []         # one entry per search (time, candidates, best sequence)
 
     def _decel_tables(self, c):
         """planned / emergency deceleration limits and the emergency stopping distance over tab_v for tyre scale c"""
@@ -2342,72 +2314,6 @@ class CorridorMPC:
         self.wlo_tab, self.whi_tab = lo, hi
 
     # ------------------------------------------------------------------ QP structure
-    def _build_qp(self):
-        N = self.n
-        nl = len(self.lpts)
-        X = lambda i, k: 5 * i + k
-        Wv = lambda i: 5 * (N + 1) + i
-        S = lambda i: 5 * (N + 1) + N + i
-        T = lambda i: 5 * (N + 1) + N + (N + 1) + i
-        self.nv = 5 * (N + 1) + N + 2 * (N + 1)
-        self.iW0, self.iS0, self.iT0 = Wv(0), S(0), T(0)
-        trip = []
-        r = 0
-        # init
-        for k in range(5):
-            trip.append((r, X(0, k)))
-            r += 1
-        self.row_dyn, self.k_dyn = r, len(trip)
-        for i in range(N):
-            for k in range(5):
-                trip.append((r, X(i + 1, k)))
-                for j in range(5):
-                    trip.append((r, X(i, j)))
-                trip.append((r, Wv(i)))
-                r += 1
-        self.row_cor, self.k_cor = r, len(trip)
-        for i in range(1, N + 1):
-            for _ in range(nl):
-                trip += [(r, X(i, 0)), (r, X(i, 1)), (r, S(i))]
-                trip += [(r + 1, X(i, 0)), (r + 1, X(i, 1)), (r + 1, S(i))]
-                r += 2
-        self.row_del, self.k_del = r, len(trip)
-        for i in range(1, N + 1):
-            trip.append((r, X(i, 4)))
-            r += 1
-        self.row_w, self.k_w = r, len(trip)
-        for i in range(N):
-            trip.append((r, Wv(i)))
-            r += 1
-        self.row_s, self.k_s = r, len(trip)
-        for i in range(N + 1):
-            trip.append((r, S(i)))
-            r += 1
-        for i in range(N + 1):
-            trip.append((r, T(i)))
-            r += 1
-        self.row_lat, self.k_lat = r, len(trip)
-        for i in range(1, N + 1):
-            trip += [(r, X(i, 3)), (r, T(i))]
-            trip += [(r + 1, X(i, 3)), (r + 1, T(i))]
-            r += 2
-        self.nrow = r
-        rows = np.array([t[0] for t in trip])
-        cols = np.array([t[1] for t in trip])
-        self.ntrip = len(trip)
-        A = sp.csc_matrix((np.arange(1, self.ntrip + 1, dtype=float), (rows, cols)), shape=(self.nrow, self.nv))
-        A.sort_indices()
-        assert A.nnz == self.ntrip
-        self.A_perm = (A.data - 1).astype(int)
-        self.A_sp = A
-        vals = np.zeros(self.ntrip)
-        vals[0:5] = 1.0
-        vals[self.k_del:self.k_lat] = 1.0          # delta, w, slack bounds rows
-        self.A_vals = vals
-        P = sp.identity(self.nv, format='csc')
-        self.P_sp = P
-        self.qp = None
-
     def _build_hpipm(self):
         N, nl = self.n, len(self.lpts)
         nx = [5] * (N + 1)
@@ -2429,16 +2335,6 @@ class CorridorMPC:
                     tol=tuple(self.hp_tol), mode=self.hp_mode)
         hp.setup_all(nbx, nbu, idxbx, idxbu, idxs, Zl, zl, R)
         return hp
-
-    def _qp_setup(self, Pd, q, Av, l, u):
-        P = sp.diags(Pd, format='csc')
-        A = self.A_sp.copy()
-        A.data = Av[self.A_perm]
-        self.qp = osqp.OSQP()
-        self.qp.setup(P, q, A, l, u, verbose=False, warm_starting=True, polishing=False,
-                      eps_abs=self.osqp_eps, eps_rel=self.osqp_eps, max_iter=self.osqp_iter, adaptive_rho=True,
-                      adaptive_rho_interval=self.osqp_rho_int, scaling=10, check_termination=5,
-                      rho=self.osqp_rho, time_limit=self.osqp_tlim)
 
     # ------------------------------------------------------------------ helpers
     def _fidx(self, s):
@@ -2462,27 +2358,14 @@ class CorridorMPC:
         return bx + d * nx, by + d * ny
 
     def _frenet(self, x, y, guess):
-        if self.jit:
-            i = int(_frenet_k(self.fx, self.fy, float(x), float(y), -1 if guess is None else int(guess)))
-            if guess is not None and (i == (guess - 12) % self.nf or i == (guess + 39) % self.nf):
-                return self._frenet(x, y, None)     # window edge: see below
-            dx, dy = x - self.fx[i], y - self.fy[i]
-            return self.fs[i] + dx * self.ftx[i] + dy * self.fty[i], dx * self.fnx[i] + dy * self.fny[i], i
-        if guess is None:
-            i = int(np.argmin((self.fx - x) ** 2 + (self.fy - y) ** 2))
-        else:
-            cand = np.arange(guess - 12, guess + 40) % self.nf
-            j = int(np.argmin((self.fx[cand] - x) ** 2 + (self.fy[cand] - y) ** 2))
-            if j == 0 or j == cand.size - 1:
-                # nearest point on the edge of the window (-0.6 .. +2 m): the car is beyond it (stall of the node at
-                # speed, pose jump); the edge point is a wrong local minimum (d off by its curvature, and it can stay
-                # locked there) -> global search
-                return self._frenet(x, y, None)
-            i = int(cand[j])
+        i = int(_frenet_k(self.fx, self.fy, float(x), float(y), -1 if guess is None else int(guess)))
+        if guess is not None and (i == (guess - 12) % self.nf or i == (guess + 39) % self.nf):
+            # nearest point on the edge of the window (-0.6 .. +2 m): the car is beyond it (stall of the node at
+            # speed, pose jump); the edge point is a wrong local minimum (d off by its curvature, and it can stay
+            # locked there) -> global search
+            return self._frenet(x, y, None)
         dx, dy = x - self.fx[i], y - self.fy[i]
-        s = self.fs[i] + dx * self.ftx[i] + dy * self.fty[i]
-        d = dx * self.fnx[i] + dy * self.fny[i]
-        return s, d, i
+        return self.fs[i] + dx * self.ftx[i] + dy * self.fty[i], dx * self.fnx[i] + dy * self.fny[i], i
 
     def _wall_bounds(self, s, c):
         k = int(round(min(max(c, 0.0), 0.6) / 0.01))
@@ -2501,8 +2384,6 @@ class CorridorMPC:
         self.fg_ok = 0
         self.fi = None
         self.s_prev = None
-        # memory counts on the map-sized grid (numpy path); the jit path keeps them aligned with the remembered cells
-        self.mem = None if self.jit else np.zeros(self.MH * self.MW, dtype=np.int16)
         self._mem_clear()
         self.blind_until = -1.0
         self.hist = []              # (t_issue, delta_target, v_cmd); they act t_lat (+ t_buf for steering) later
@@ -2534,14 +2415,11 @@ class CorridorMPC:
         self.sol = None             # previous MPC solution: (stations, X (N+1,5), w (N))
         self.prev_sides = []
         self.seen_boxes = []
-        self.box_ext = []
         self.box_conf = []
         self.conf_idx = {}          # s bucket -> indices into box_conf (lookup cost independent of lap length)
         self._ps_cache = [None, None, None]   # (list, bucket index, memo) of prev_sides / seen_boxes for _first_match
         self._sb_cache = [None, None, None]
         self.box_age = []
-        self.qp = None
-        self.z_prev = None
         self.qp_info = None
         self.prof = None
         self.t_stop = None
@@ -2549,13 +2427,8 @@ class CorridorMPC:
         self.plan = None
         self.phase = 0
         self.sol_bad = False
-        if self.debug:
-            self.dbg = getattr(self, 'dbg', None) or []
-        else:
-            self.dbg = None
         self.n_fail = 0
         self.n_resolve = 0
-        self.a_acc_eff = self.a_acc
         self.a_cmd = 0.0
         self.t_prev_cmd = None
         self.t_off = None           # internal time base (see _clock)
@@ -2567,6 +2440,22 @@ class CorridorMPC:
         self.out_pos = False        # previous pose / yaw sample was rejected as an outlier (see _observe)
         self.out_yaw = False
         self._no_latch = False      # teleport call: perception skipped, the extent latches are not updated
+        self.odo = 0.0              # metres driven (|v| dt) since the start
+        self.lap_boxes = 0          # DP calls with boxes in this lap
+        self.lap_clear = False
+        if getattr(self, 'base_kw', None) is not None and self.obs_mem != 0.0:
+            self._set_mode(True)    # after a reset (re-placed car): obstacle mode until a clear lap
+        self.t_odo = None
+        self.tr_extra = None
+        self.slow_at = None
+        self.weaves = []
+        self.man = None             # running manoeuvre (arc sequence, see _backoff)
+        self.tr_mode = None         # diagnostics: ('settle' | 'drive', arc index) while a manoeuvre commands
+        self.n_back = 0
+        self.back_s = 0.0
+        self._creep_blocked = False
+        if not hasattr(self, 'n_back_tot'):
+            self.n_back_tot = 0
 
     def _clock(self, t):
         """internal time: relative to the first call after reset() and never running backwards.  A clock that jumped
@@ -2583,23 +2472,6 @@ class CorridorMPC:
         return ti
 
     # ------------------------------------------------------------------ actuator models
-    def _hist_arr(self):
-        if getattr(self, '_H', None) is not None:
-            return self._H
-        h = self.hist
-        return np.array(h, dtype=np.float64).reshape(len(h), 3)
-
-    def _targets(self, tt):
-        """steering target and speed command active at time tt (command latency t_lat, steering + t_buf)"""
-        dl, vc = None, None
-        ts0, tv0 = tt + 1e-6 - self.t_lat - self.t_buf, tt + 1e-6 - self.t_lat
-        for (ti, d_, v_) in self.hist:
-            if ti <= ts0:
-                dl = d_
-            if ti <= tv0:
-                vc = v_
-        return dl, vc
-
     def _lat_update(self, t, v):
         """online estimate of the command latency (multiple-model): the simulator's speed P-controller (p_accel) is
         driven by this driver's own speed commands, delayed by each candidate latency; every hypothesis keeps its
@@ -2617,7 +2489,7 @@ class CorridorMPC:
         # speed-noise variance measured by the pose filter (innovation correlation; 0 for exact speeds)
         R = self._noise_R('v') if self.lat_noise_floor else 0.0
         cap = max(self.lat_cap, 3.0 * math.sqrt(R))
-        H = (self._H if self._H is not None else np.array(self.hist, dtype=np.float64)).T.copy()
+        H = self._H.T.copy()
         vL = np.full(self.lat_c.size, float(v0)) if self.lat_v is None else self.lat_v
         vL, ok = _lat_sim_k(H[0], H[2], self.lat_c, vL, float(t0), n)
         e = np.minimum(np.maximum(v - vL, -cap), cap)
@@ -2662,7 +2534,7 @@ class CorridorMPC:
         n = int(round((t - t_l) / 0.01))
         ok = 0 < n <= 20
         if ok:
-            H = (self._H if self._H is not None else np.array(self.hist, dtype=np.float64)).T.copy()
+            H = self._H.T.copy()
             vO, ok = _lat_sim_k(H[0], H[2], self.lat_c, vO, float(t_l), n)
         if not ok:
             self._fg_start(t, v)
@@ -2696,16 +2568,6 @@ class CorridorMPC:
         self.fg = [t, t, np.full(self.lat_c.size, float(v)), sn]
         self.fg_e2 = np.zeros(self.cg_J.size)
         self.fg_ne = 0
-
-    @staticmethod
-    def _servo_step(delta, tgt):
-        if tgt is None:
-            return delta
-        diff = tgt - delta
-        step = STEER_RATE * 0.01
-        if abs(diff) > 1e-4:
-            delta += max(-step, min(step, diff))
-        return max(-STEER_MAX, min(STEER_MAX, delta))
 
     def _gain(self, key, e, qmin):
         """adaptive gain of a scalar random-walk filter.  e = (measured - model) increment between two successive
@@ -2757,25 +2619,10 @@ class CorridorMPC:
         rr = self.cg_rr
         bb[0], rr[0] = self.beta_est, rf0
         bb[1:], rr[1:] = self.cg_b, self.cg_r
-        if self.jit:
-            delta, vm, dmain, amain, vms, vck, hvk = _obs_main_k(self._hist_arr(), float(self.t_lat), float(self.t_buf),
-                                                                 float(t0), int(n), float(vf0), float(self.delta_est))
-        else:
-            delta = self.delta_est
-            vm = vf0
-            m_ = max(n, 1)
-            dmain, amain, vms, vck = np.empty(m_), np.empty(m_), np.empty(m_), np.zeros(m_)
-            hvk = np.zeros(m_, dtype=np.bool_)
-            for k in range(n):
-                tgt, vc = self._targets(t0 + 0.01 * k)
-                delta = self._servo_step(delta, tgt)
-                a = p_accel(vc, vm) if vc is not None else 0.0
-                dmain[k], amain[k], vms[k] = delta, a, vm
-                vck[k], hvk[k] = (vc, True) if vc is not None else (0.0, False)
-                vm = max(0.0, vm + a * 0.01)
+        delta, vm, dmain, amain, vms, vck, hvk = _obs_main_k(self._H, float(self.t_lat), float(self.t_buf), float(t0),
+                                                             int(n), float(vf0), float(self.delta_est))
         if short and n > 0:
-            H = self._H if self._H is not None else np.array(self.hist, dtype=np.float64).reshape(len(self.hist), 3)
-            _mm_prop(bb, rr, self.cg_d, cv, self.l_grid_v, self.c_grid_v.size, H, float(self.t_lat), float(self.t_buf),
+            _mm_prop(bb, rr, self.cg_d, cv, self.l_grid_v, self.c_grid_v.size, self._H, float(self.t_lat), float(self.t_buf),
                      float(t0), int(n), float(vf0), float(v), dmain, amain, vms)
         filt = self.pose_filt and n > 0 and short
         # 2) speed and yaw rate
@@ -2809,38 +2656,10 @@ class CorridorMPC:
         yawf = float(_wrap(yawf0 + dyaw + kyw * inn_y))
         # 4) sideslip (exact for the linear beta ODE over 10 ms, filtered speed / yaw rate) and the predicted course
         dyw = float(_wrap(yawf - yawf0))
-        if self.jit:
-            beta, has_mid, bm, px_, py_ = _obs_beta_k(int(n), float(vf0), float(vf), float(rf0), float(rf),
-                                                      float(yawf0), dyw, float(xf0), float(yf0), float(self.beta_est),
-                                                      dmain, vck, hvk, float(self.c_tyre))
-            beta_mid = bm if has_mid else None
-        else:
-            beta = self.beta_est
-            beta_mid = None
-            px_, py_ = xf0, yf0
-            for k in range(n):
-                b_before = beta
-                f = (k + 0.5) / max(n, 1)
-                vk = vf0 + (vf - vf0) * f
-                rk = rf0 + (rf - rf0) * f
-                a = p_accel(vck[k], vk) if hvk[k] else 0.0
-                yk = yawf0 + dyw * f
-                if vk >= 0.5:
-                    a11, a12, b1, _, _, _ = bicycle_s(vk, a, self.c_tyre)
-                    e = math.exp(a11 * 0.01)
-                    bss = -(a12 * rk + b1 * dmain[k]) / a11
-                    bmid_ = bss + (beta - bss) * math.exp(a11 * 0.005)
-                    beta = bss + (beta - bss) * e
-                else:
-                    bmid_ = beta = 0.0
-                px_ += vk * math.cos(yk + bmid_) * 0.01
-                py_ += vk * math.sin(yk + bmid_) * 0.01
-                # sideslip at the middle of the interval (the chord's course): after n/2 steps
-                h2 = 2 * (k + 1)
-                if h2 == n:
-                    beta_mid = beta
-                elif h2 == n + 1:
-                    beta_mid = 0.5 * (b_before + beta)
+        beta, has_mid, bm, px_, py_ = _obs_beta_k(int(n), float(vf0), float(vf), float(rf0), float(rf), float(yawf0),
+                                                  dyw, float(xf0), float(yf0), float(self.beta_est), dmain, vck, hvk,
+                                                  float(self.c_tyre))
+        beta_mid = bm if has_mid else None          # sideslip at the middle of the interval (the chord's course)
         # 5) position
         x_keep, y_keep = x, y                        # what the next call takes as the previous raw position
         p_out = False
@@ -2929,87 +2748,11 @@ class CorridorMPC:
 
     def _predict(self, t, x, y, yaw, v, r, t_pred):
         """nonlinear single-track prediction to t + t_pred with the commands in flight"""
-        delta, beta = self.delta_est, self.beta_est
-        if self.jit:
-            return _predict_k(self._hist_arr(), float(self.t_lat), float(self.t_buf), float(t), float(x), float(y),
-                              float(yaw), float(v), float(r),
-                              float(t_pred), float(delta), float(beta), float(self.c_tyre))
-        n = int(round(t_pred / 0.01))
-        a = 0.0
-        for k in range(n):
-            tt = t + 0.01 * k
-            tgt, vc = self._targets(tt)
-            delta = self._servo_step(delta, tgt)
-            a = p_accel(vc, v) if vc is not None else 0.0
-            if v >= 0.5:
-                a11, a12, b1, a21, a22, b2 = bicycle_s(v, a, self.c_tyre)
-                # explicit Euler on the (beta, r) modes (about -210 1/s at 0.5 m/s, ~1/v): unstable below ~0.53 m/s and
-                # sign-flipping up to ~1 m/s with 10 ms steps (the simulator integrates with RK4) -> sub-steps keep
-                # |lambda h| <= 0.7; one step above ~1.5 m/s as before
-                m = max(1, int(math.ceil(-0.01 * min(a11, a22) / 0.7)))
-                h = 0.01 / m
-                for _ in range(m):
-                    bd = a11 * beta + a12 * r + b1 * delta
-                    rd = a21 * beta + a22 * r + b2 * delta
-                    x += v * math.cos(yaw + beta) * h
-                    y += v * math.sin(yaw + beta) * h
-                    yaw += r * h
-                    beta += bd * h
-                    r += rd * h
-            else:
-                x += v * math.cos(yaw) * 0.01
-                y += v * math.sin(yaw) * 0.01
-                r = v * math.tan(delta) / WB
-                yaw += r * 0.01
-                beta = 0.0
-            v = max(0.0, v + a * 0.01)
-        return x, y, yaw, v, beta, r, delta, a
+        return _predict_k(self._H, float(self.t_lat), float(self.t_buf), float(t), float(x), float(y), float(yaw),
+                          float(v), float(r), float(t_pred), float(self.delta_est), float(self.beta_est),
+                          float(self.c_tyre))
 
     # ------------------------------------------------------------------ perception
-    def _perceive(self, scan, lx, ly, yaw, t):
-        cy, sy = math.cos(yaw), math.sin(yaw)
-        if self.jit:
-            self._perceive_jit(scan, lx, ly, yaw, t, cy, sy)
-            return
-        if t >= self.blind_until:
-            ok = (scan > 0.05) & (scan < self.r_max)
-            r = scan[ok]
-            ux = cy * self.ca[ok] - sy * self.sa[ok]
-            uy = sy * self.ca[ok] + cy * self.sa[ok]
-            px = lx + r * ux
-            py = ly + r * uy
-            col = np.floor((px - self.ox) / self.res).astype(int)
-            row = np.floor((py - self.oy) / self.res).astype(int)
-            inb = (col >= 0) & (col < self.W) & (row >= 0) & (row < self.H)
-            px, py, col, row = px[inb], py[inb], col[inb], row[inb]
-            isobs = self.edt[row, col] > self.obs_edt
-            if np.any(isobs):
-                mc = np.floor((px[isobs] - self.ox) / self.mres).astype(int)
-                mr = np.floor((py[isobs] - self.oy) / self.mres).astype(int)
-                cells = np.unique(mr * self.MW + mc)
-                self.mem[cells] = np.minimum(self.mem[cells] + 2, 12)
-                self.active = np.union1d(self.active, cells)
-        # free-space carving of remembered cells the beams now see through
-        if self.carve and self.active.size:
-            a = self.active
-            dx = self.cell_x[a] - lx
-            dy = self.cell_y[a] - ly
-            rng = np.hypot(dx, dy)
-            brg = _wrap(np.arctan2(dy, dx) - yaw)
-            b = np.rint((brg - ANG_MIN) / ANG_INC).astype(int)
-            chk = (b >= 2) & (b <= 1077) & (rng > 0.4) & (rng < 7.0)
-            if np.any(chk):
-                bb = b[chk]
-                mn = np.minimum.reduce([scan[bb - 2], scan[bb - 1], scan[bb], scan[bb + 1], scan[bb + 2]])
-                seen = mn > rng[chk] + 0.20
-                if np.any(seen):
-                    cs = a[chk][seen]
-                    self.mem[cs] -= 1
-                    dead = cs[self.mem[cs] <= 0]
-                    if dead.size:
-                        self.mem[dead] = 0
-                        self.active = np.setdiff1d(self.active, dead, assume_unique=True)
-
     def _mem_clear(self):
         """forget all remembered obstacle cells (lap wrap, reset)"""
         self.active = np.zeros(0, dtype=np.int64)
@@ -3026,10 +2769,11 @@ class CorridorMPC:
         brg = _wrap(np.arctan2(dy, dx) - yaw)
         return rng, brg, np.rint((brg - ANG_MIN) / ANG_INC).astype(np.int64)
 
-    def _perceive_jit(self, scan, lx, ly, yaw, t, cy, sy):
-        """_perceive on the compact remembered set: the per-cell map attributes (x, y, s, d, ok) and memory counts are
-        kept in arrays aligned with the sorted cell ids, so the per-call work touches only those (no gathers into the
-        map-sized grids, no set operations by sorting); the cells' view of this scan is kept for _boxes"""
+    def _perceive(self, scan, lx, ly, yaw, t):
+        """scan hits farther than obs_edt from the map -> remembered obstacle cells; free-space carving.  The per-cell
+        map attributes (x, y, s, d, ok) and memory counts are kept in arrays aligned with the sorted cell ids, so the
+        per-call work touches only those; the cells' view of the scan is kept for _boxes"""
+        cy, sy = math.cos(yaw), math.sin(yaw)
         self._view = None
         if t >= self.blind_until:
             cells = _hits_k(scan, float(lx), float(ly), cy, sy, self.ca, self.sa, float(self.r_max), self.ox, self.oy,
@@ -3053,112 +2797,11 @@ class CorridorMPC:
     def _boxes(self, s_car, scan, lx, ly, yaw):
         """cluster remembered cells near the planning window into Frenet boxes [s_lo, s_hi, d_lo, d_hi].
         The hidden back is added (hidden_depth); a lateral end that the current scan shows bounded by a closer
-        return (occluded) is extended to the largest possible footprint width (w_max)."""
-        a = self.active
-        if a.size == 0:
+        return (occluded) is extended to the largest possible footprint width (w_max).  Selection, clustering and
+        per-cluster statistics in _boxes_k with the cells' view of this scan from _perceive, then the latch logic of
+        _extent_latch per cluster"""
+        if self.active.size == 0:
             return []
-        if self.jit and self.occl_fix and not self.box_mono:
-            return self._boxes_jit(s_car, scan, lx, ly, yaw)
-        a = a[self.cell_ok[a]]
-        if a.size > 60:
-            # one representative per 2x2 block keeps the extent (+- one fine cell) and quarters the work
-            blk = (a // self.MW // 2) * self.W + (a % self.MW) // 2
-            _, first = np.unique(blk, return_index=True)
-            keep = np.zeros(a.size, dtype=bool)
-            keep[first] = True
-            # keep all cells on the outline of each block set: simply also keep extreme cells per block
-            a = a[keep] if a.size > 400 else a
-        rel = np.mod(self.cell_s[a] - s_car + self.L / 2, self.L) - self.L / 2
-        win = (rel > -1.5) & (rel < self.n * self.ds + 1.0)
-        a, rel = a[win], rel[win]
-        if a.size == 0:
-            return []
-        xs, ys = self.cell_x[a], self.cell_y[a]
-        dd = self.cell_d[a]
-        if a.size == 1:
-            labels = np.zeros(1, dtype=int)
-            nc = 1
-        else:
-            roots = _cluster_k(xs.astype(np.float64), ys.astype(np.float64), float(self.link))
-            _, labels = np.unique(roots, return_inverse=True)
-            nc = int(labels.max()) + 1
-        # current view of every cell
-        dxl, dyl = xs - lx, ys - ly
-        rng = np.hypot(dxl, dyl)
-        brg = _wrap(np.arctan2(dyl, dxl) - yaw)
-        bi = np.rint((brg - ANG_MIN) / ANG_INC).astype(int)
-        inv = (bi >= 0) & (bi <= 1079)
-        bic = np.minimum(np.maximum(bi, 0), 1079)
-        seen = inv & (np.abs(scan[bic] - rng) < 0.08)
-        out = []
-        half = self.mres / 2
-        for c in range(nc):
-            m = labels == c
-            ss = rel[m] + s_car
-            dl = dd[m]
-            s_lo, s_hi = float(ss.min()) - half, float(ss.max()) + half
-            d_lo, d_hi = float(dl.min()) - half, float(dl.max()) + half
-            s_hi = max(s_hi, s_lo + self.hidden_depth)
-            if self.occl_fix:
-                d_lo, d_hi = self._extent_fix(m, seen, brg, bi, rng, dd, scan, s_lo, s_hi, d_lo, d_hi)
-            elif d_hi - d_lo < self.min_width:
-                dc = 0.5 * (d_lo + d_hi)
-                d_lo = min(d_lo, dc - self.min_width / 2)
-                d_hi = max(d_hi, dc + self.min_width / 2)
-            if self.occl_ext and not self.occl_fix and d_hi - d_lo < self.w_max:
-                # per-obstacle latch: an edge seen once with free space beyond it is real (never extended again)
-                smr, dcr = 0.5 * (s_lo + s_hi), 0.5 * (d_lo + d_hi)
-                ent = self._conf_entry(smr, dcr, 2)
-                ms = m & seen
-                if np.any(ms) and abs(float(np.mean(brg[ms]))) < 1.1:
-                    idx = np.flatnonzero(ms)
-                    i_lo = idx[np.argmin(bi[idx])]
-                    i_hi = idx[np.argmax(bi[idx])]
-                    ext = []
-                    for ie, step in ((i_lo, -1), (i_hi, 1)):
-                        b0 = int(bi[ie])
-                        nb = [b0 + step * k for k in (1, 2, 3) if 0 <= b0 + step * k <= 1079]
-                        mnb = float(np.fmin.reduce(scan[nb])) if len(nb) == 3 else 0.0
-                        if math.isnan(mnb):
-                            continue          # only invalid beams beyond the edge: no information
-                        occl = (len(nb) < 3) or (mnb < rng[ie] - 0.05)
-                        ext.append((occl, float(dd[ie])))
-                    for occl, dend in ext:
-                        low_side = dend <= dcr
-                        k_ = 2 if low_side else 3
-                        if not occl:
-                            ent[k_] = True
-                            continue
-                        if ent[k_]:
-                            continue
-                        if low_side:
-                            d_lo = min(d_lo, d_hi - self.w_max)
-                        else:
-                            d_hi = max(d_hi, d_lo + self.w_max)
-            out.append([s_lo - self.obs_pad_s, s_hi + self.obs_pad_s, d_lo - self.obs_pad_d, d_hi + self.obs_pad_d])
-        # static obstacles never shrink: keep the union with the extent seen before in this lap
-        if self.box_mono:
-            for b in out:
-                smid, dc = 0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3])
-                hit = None
-                for e in self.box_ext:
-                    if abs(e[0] - smid) < 0.4 and abs(e[1] - dc) < 0.35:
-                        hit = e
-                        break
-                if hit is None:
-                    self.box_ext.append([smid, dc, b[0], b[1], b[2], b[3]])
-                else:
-                    b[0] = min(b[0], hit[2])
-                    b[1] = max(b[1], hit[3])
-                    b[2] = min(b[2], hit[4])
-                    b[3] = max(b[3], hit[5])
-                    hit[2:] = b[:]
-        out.sort(key=lambda b: b[0])
-        return out
-
-    def _boxes_jit(self, s_car, scan, lx, ly, yaw):
-        """_boxes (occl_fix) on the compact remembered set: selection, clustering and per-cluster statistics in
-        _boxes_k with the cells' view of this scan from _perceive, then the latch logic of _extent_fix per cluster"""
         view = self._view if self._view is not None else self._view_of(lx, ly, yaw)
         rmin, rmax, dmin, dmax, nseen, bmean, occl = _boxes_k(
             self.active, self.act_ok, self.act_s, self.act_x, self.act_y, self.act_d, view[0], view[1], view[2], scan,
@@ -3175,28 +2818,6 @@ class CorridorMPC:
             out.append([s_lo - self.obs_pad_s, s_hi + self.obs_pad_s, d_lo - self.obs_pad_d, d_hi + self.obs_pad_d])
         out.sort(key=lambda b: b[0])
         return out
-
-    def _extent_fix(self, m, seen, brg, bi, rng, dd, scan, s_lo, s_hi, o_lo, o_hi):
-        """lateral extent of one cluster from its observed cells [o_lo, o_hi]: an edge with free space beyond it
-        (beams past the edge return farther) is real and latched; an edge with a closer return beyond it is hidden
-        behind something and is extended to the largest footprint (w_max) until it is seen free.  Edges are told
-        apart by beam order (lower beam index = right = lower d while the car looks along the track)."""
-        ms = m & seen
-        use = bool(np.any(ms) and abs(float(np.mean(brg[ms]))) < 1.1)
-        occl = [False, False]
-        if use:
-            idx = np.flatnonzero(ms)
-            for side, (ie, step) in enumerate(((idx[np.argmin(bi[idx])], -1), (idx[np.argmax(bi[idx])], 1))):
-                b0 = int(bi[ie])
-                nb = [b0 + step * k for k in (1, 2, 3) if 0 <= b0 + step * k <= 1079]
-                # NaN beams (invalid returns) carry no information: np.min gave NaN, the comparison False and the edge
-                # was latched 'seen free' for the rest of the lap (hidden side never extended again)
-                mnb = float(np.fmin.reduce(scan[nb])) if len(nb) == 3 else 0.0
-                if math.isnan(mnb):
-                    occl[side] = 2            # only invalid beams beyond the edge: no information
-                    continue
-                occl[side] = (len(nb) < 3) or (mnb < rng[ie] - 0.05)
-        return self._extent_latch(s_lo, s_hi, o_lo, o_hi, use, occl)
 
     def _conf_entry(self, smr, dcr, nflag):
         """the first box_conf entry (insertion order) within 0.4 m in s and 0.35 m in d of (smr, dcr), else a new one;
@@ -3218,8 +2839,12 @@ class CorridorMPC:
         return ent
 
     def _extent_latch(self, s_lo, s_hi, o_lo, o_hi, use, occl):
-        """the latch of _extent_fix from its scan evidence (also precomputed by _clusters_k): use = some cells seen and
-        the cluster ahead (mean bearing < 1.1 rad), occl = (low-index edge hidden, high-index edge hidden)"""
+        """lateral extent of one cluster from its observed cells [o_lo, o_hi]: an edge with free space beyond it
+        (beams past the edge return farther) is real and latched; an edge with a closer return beyond it is hidden
+        behind something and is extended to the largest footprint (w_max) until it is seen free.  Edges are told
+        apart by beam order (lower beam index = right = lower d while the car looks along the track).  Scan evidence
+        from _clusters_k: use = some cells seen and the cluster ahead (mean bearing < 1.1 rad), occl = (low-index
+        edge, high-index edge): 0 seen free, 1 hidden, 2 no information (only NaN beams beyond it)"""
         ent = self._conf_entry(0.5 * (s_lo + s_hi), 0.5 * (o_lo + o_hi), 4)
         if use and not self._no_latch:
             for kc, oc in ((2, occl[0]), (3, occl[1])):
@@ -3273,159 +2898,21 @@ class CorridorMPC:
         return res
 
     def _prev_side(self, smid, dc):
-        if self.jit:
-            e = self._first_match(self.prev_sides, self._ps_cache, smid, dc, 0.35, 0.3)
-            return None if e is None else e[2]
-        for e in self.prev_sides:
-            if abs(e[0] - smid) < 0.35 and abs(e[1] - dc) < 0.3:
-                return e[2]
-        return None
+        e = self._first_match(self.prev_sides, self._ps_cache, smid, dc, 0.35, 0.3)
+        return None if e is None else e[2]
 
     def _first_seen(self, smid, dc, t):
-        if self.jit:
-            e = self._first_match(self.seen_boxes, self._sb_cache, smid, dc, 0.4, 0.35)
-            return t if e is None else e[2]
-        for e in self.seen_boxes:
-            if abs(e[0] - smid) < 0.4 and abs(e[1] - dc) < 0.35:
-                return e[2]
-        return t
+        e = self._first_match(self.seen_boxes, self._sb_cache, smid, dc, 0.4, 0.35)
+        return t if e is None else e[2]
 
     # ------------------------------------------------------------------ DP side selection
     def _dp(self, s0, d0, chi0, boxes, v, w_h, relax=(), hard=True, gap=True):
         """2nd-order DP over (station, lateral offset, slope): picks the side of every obstacle with a
-        curvature-limited path; returns MPC stations, DP path on them, sides, first blocked s"""
-        N, ds = self.n, self.ds
-        if self.jit:
-            return self._dp_jit(s0, d0, chi0, boxes, v, w_h, relax, hard, gap)
-        st = s0 + ds * np.arange(N + 1)
-        Ds, dd = self.dp_ds, self.dd
-        M = int(round(N * ds / Ds))
-        sd = s0 + Ds * np.arange(M + 1)
-        sq = dd / Ds                                   # slope quantum
-        Kmax = self.dp_kmax
-        kv = np.arange(-Kmax, Kmax + 1)
-        K = kv.size
-        wlo, whi = self._wall_bounds(sd, self.wc_eff)
-        jlo = int(math.floor((min(max(wlo.min(), -self.dp_dmax), d0) + 3.5) / dd)) - 1
-        jhi = int(math.ceil((max(min(whi.max(), self.dp_dmax), d0) + 3.5) / dd)) + 1
-        dg = -3.5 + dd * np.arange(max(jlo, 0), min(jhi, int(7.0 / dd)) + 1)
-        J = dg.size
-        blocked = (dg[None, :] < wlo[:, None]) | (dg[None, :] > whi[:, None])
-        cost_node = np.repeat((self.w_dev * dg ** 2 * Ds)[None, :], M + 1, axis=0)
-        wlo2, whi2 = self._wall_bounds(sd, self.wall_pref)
-        pen = np.maximum(0.0, wlo2[:, None] - dg[None, :]) + np.maximum(0.0, dg[None, :] - whi2[:, None])
-        cost_node += self.w_wall * pen ** 2 * Ds
-        half = 0.5 * Ds
-        for bi_, b in enumerate(boxes):
-            ks = np.flatnonzero((sd >= b[0] - half) & (sd <= b[1] + half))
-            if ks.size == 0:
-                continue
-            lo, hi = b[2] - w_h, b[3] + w_h
-            near = ks[(sd[ks] - s0) < self.dp_near]
-            far = ks[(sd[ks] - s0) >= self.dp_near]
-            inside = (dg > lo) & (dg < hi)
-            if far.size:
-                blocked[np.ix_(far, np.flatnonzero(inside))] = True
-                if gap and self.min_gap_w > 0.0:
-                    # a side whose corridor (obstacle .. wall) is narrower than min_gap_w is not offered: such a gap
-                    # appears and disappears with every small change of the estimate (late side flips).  A side
-                    # already chosen keeps being offered down to min_gap_keep (hysteresis: a narrow gap that shrinks
-                    # by 3 cm while the car approaches at speed must not force a flip it cannot drive)
-                    pv_ = self._prev_side(0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]))
-                    g_hi = self.min_gap_keep if pv_ == 1 else self.min_gap_w
-                    g_lo = self.min_gap_keep if pv_ == -1 else self.min_gap_w
-                    if float(np.min(whi[far])) - hi < g_hi:
-                        blocked[np.ix_(far, np.flatnonzero(dg >= hi))] = True
-                    if lo - float(np.max(wlo[far])) < g_lo:
-                        blocked[np.ix_(far, np.flatnonzero(dg <= lo))] = True
-            if near.size:
-                cost_node[np.ix_(near, np.flatnonzero(inside))] += self.p_near
-            clr = np.maximum(lo - dg, dg - hi)
-            soft = np.maximum(0.0, self.c_pref - clr)
-            cost_node[ks] += self.w_soft * soft[None, :] ** 2 * Ds
-            smid, dc = 0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3])
-            prev = self._prev_side(smid, dc)
-            if prev is not None:
-                dist = b[0] - (s0 + BOX_FRONT)
-                dnear = max(self.commit_d, self.commit_t * v)
-                f = min(1.0, max(0.0, (dnear + self.commit_ramp - dist) / self.commit_ramp))
-                # releasing a commitment (forced flip in the cluster, or a neighbour that just appeared) is only
-                # allowed outside the hard-commit distance: near obstacles keep their side, the car brakes instead
-                if dist > dnear + self.release_margin:
-                    if bi_ in relax:
-                        f = 0.0
-                    for c2, age in zip(boxes, self.box_age):
-                        if c2 is not b and age < self.young_t and abs(0.5 * (c2[0] + c2[1]) - smid) < self.cluster_ds:
-                            f = 0.0
-                            break
-                pf = self.p_flip + (self.p_flip_hard - self.p_flip) * f
-                kmid = ks[len(ks) // 2]
-                wrong = (dg < dc) if prev > 0 else (dg > dc)
-                if hard and f >= 1.0 and dist < dnear and v > self.hard_block_v:
-                    # committed and close: never flip here (brake instead if the side looks closed)
-                    blocked[np.ix_(ks, np.flatnonzero(wrong))] = True
-                else:
-                    cost_node[kmid, wrong] += pf
-        # curvature limit per DP station: the slowest speed the car can have there (planned braking)
-        dist = sd - s0
-        vr = np.interp(np.maximum(v * v - 2.0 * self.dp_adec * dist, 0.0) ** 0.5, [0.0, 100.0], [0.0, 100.0])
-        vdp = np.maximum(np.minimum(vr, self.dp_vmax), self.dp_vfloor)
-        kap = np.minimum(np.minimum(STEER_MAX / (WB + K_US0 / self.c_tyre * vdp * vdp), self.a_lat_hard / (vdp * vdp)),
-                         self.dp_kcap)
-        cst = np.minimum(np.maximum(np.floor(kap * Ds / sq + 1e-9).astype(np.int64), 1), Kmax)
-        c = int(cst.max())
-        cv_cost = self.w_cv * (np.arange(-c, c + 1) * sq / Ds) ** 2 * Ds
-        sl_cost = self.w_sl * (kv * sq) ** 2 * Ds
-        if self.dp_kgeo > 0.0:
-            # geometric curvature of the path kr / D + d'' / D^2 (D = 1 - kr d) within the steering limit: on the
-            # inside of a tight turn the same d'' is a much tighter radius (hairpins of narrow tracks)
-            kr_d = self._finterp(self.fk, sd)[:, None]
-            kg = self.dp_kgeo * STEER_MAX / (WB + K_US0 / self.c_tyre * self.dp_vfloor ** 2)
-            Dm = np.maximum(1.0 - kr_d * dg[None, :], 0.05)
-            dlo = (-kg * Dm - kr_d) * Dm * (Ds / sq)
-            dhi = (kg * Dm - kr_d) * Dm * (Ds / sq)
-        else:
-            dlo = np.full((M + 1, J), -100.0)
-            dhi = np.full((M + 1, J), 100.0)
-        cost0 = np.full((J, K), np.inf)
-        j0 = min(max(int(round((d0 - dg[0]) / dd)), 0), J - 1)
-        k0 = min(max(int(round(math.tan(max(-1.2, min(1.2, chi0))) / sq)), -Kmax), Kmax) + Kmax
-        cost0[j0, max(k0 - 1, 0):min(k0 + 2, K)] = 0.0
-        back, cost, reach = _dp_core(cost0, np.ascontiguousarray(cost_node), np.ascontiguousarray(blocked),
-                                     kv.astype(np.int64), cst, cv_cost, sl_cost, dlo, dhi, float(self.w_geo))
-        if reach < M:
-            pass
-        flat = int(np.argmin(cost)) if reach == M else None
-        if flat is None:
-            # recompute the cost at the last reached station: rerun to that station
-            back, cost, reach2 = _dp_core(cost0, np.ascontiguousarray(cost_node[:reach + 1]),
-                                          np.ascontiguousarray(blocked[:reach + 1]), kv.astype(np.int64),
-                                          cst[:reach + 1], cv_cost, sl_cost, dlo, dhi, float(self.w_geo))
-            flat = int(np.argmin(cost))
-        jb, kb = divmod(flat, K)
-        path_j = np.zeros(M + 1, dtype=int)
-        path_j[reach] = jb
-        for i in range(reach, 0, -1):
-            dl = int(back[i - 1, jb, kb]) - c
-            jp = jb - kv[kb]
-            kb = kb - dl
-            jb = jp
-            path_j[i - 1] = jb
-        path_j[reach + 1:] = path_j[reach]
-        dpath_dp = dg[path_j]
-        dpath = np.interp(st, sd, dpath_dp)
-        sides = []
-        for b in boxes:
-            ks = np.flatnonzero((sd >= b[0] - half) & (sd <= b[1] + half) & (np.arange(M + 1) <= reach))
-            if ks.size == 0:
-                sides.append(0)
-                continue
-            sides.append(1 if np.mean(dpath_dp[ks]) > 0.5 * (b[2] + b[3]) else -1)
-        s_block = sd[reach + 1] if reach < M else None
-        return st, dpath, sides, s_block
-
-    def _dp_jit(self, s0, d0, chi0, boxes, v, w_h, relax, hard, gap):
-        """_dp with the numerics in _dp_k; the side commitments (previous sides, young neighbours) stay here"""
+        curvature-limited path; returns MPC stations, DP path on them, sides, first blocked s.  The numerics run in
+        _dp_k; the side commitments (previous sides, young neighbours) are set here"""
+        if self.g_narrow >= 0.0 and boxes and self.obs_on and gap:
+            # (the narrow-side closing belongs to the gap rule: the fallbacks without it may use a narrow side)
+            boxes = self._close_narrow(s0, boxes, v, w_h)
         nbx = len(boxes)
         bx = np.array(boxes, dtype=np.float64).reshape(-1, 4)
         bprev = np.zeros(nbx, dtype=np.int64)
@@ -3464,381 +2951,89 @@ class CorridorMPC:
             float(self.min_gap_keep), self.fk, float(self.L), float(self.dp_kgeo), float(self.w_geo))
         return st, dpath, sides.tolist(), (None if math.isnan(s_block) else float(s_block))
 
-    def _corridor(self, s, boxes, sides, w_h, s_block):
-        lo, hi = self._wall_bounds(s, self.wc_eff)
-        lo = lo.copy()
-        hi = hi.copy()
-        for b, sd in zip(boxes, sides):
-            if sd == 0:
-                continue
-            m = (s >= b[0]) & (s <= b[1])
-            if sd > 0:
-                lo[m] = np.maximum(lo[m], b[3] + w_h)
-            else:
-                hi[m] = np.minimum(hi[m], b[2] - w_h)
-        return lo, hi
-
     # ------------------------------------------------------------------ speed profile
     def _abrake(self, tab, v):
         return tab[min(int(max(v, 0.0) * 20.0), tab.size - 1)]
 
-    def _speed_profile(self, st, d, mu, beta, kr, v0, scan, lx, ly, yaw, s_block, kyaw=None):
-        """returns (vprof target speeds, vpred predicted speeds, accel per station, s_vis)"""
-        N = self.n
-        if self.jit and not self.vis_obs_stop:
-            # compiled path (same computation as below)
-            f64 = lambda a: np.ascontiguousarray(a, dtype=np.float64)
-            vprof, vpred, acc, dpl, kv, v0_lim, self._sp_cum = _speed_k(
-                f64(st), f64(d), f64(mu), f64(beta), f64(kr), float(v0), f64(scan), float(lx), float(ly), float(yaw),
-                math.nan if s_block is None else float(s_block), self._no_kyaw if kyaw is None else f64(kyaw),
-                self.fx, self.fy, self.fnx, self.fny, self.fpsi, self.fvx, float(self.L), float(self.fds),
-                float(self.ds), float(self.v_max), float(self.a_lat), float(self.v_end_scale), float(self.swerve_w),
-                float(self.a_acc), float(self.gg), float(self.gg_min), float(self.a_acc_eff), float(self.vis_tol),
-                float(self.vis_start), float(self.m_vis), float(self.m_blk), float(self.t_react), float(self.v_vis_safe),
-                self.tab_plan, self.tab_emerg, self.tab_dstop, self.tab_v)
-            self.vlim0 = float(v0_lim)
-            return vprof, vpred, acc, dpl, (float(st[kv]) if kv >= 0 else None)
-        chi = mu + beta
-        scale = (1.0 - kr * d) / np.maximum(np.cos(chi), 0.3)
-        dpl = self.ds * np.maximum(scale[:-1], 0.2)
-        cum = np.concatenate([[0.0], np.cumsum(dpl)])
-        # geometric curvature of the path from the course angle
-        heading = self._heading(st) + chi
-        kg = np.zeros(N + 1)
-        kg[:-1] = _wrap(np.diff(heading)) / dpl
-        kg[-1] = kg[-2]
-        ka = np.abs(kg)
-        if self.swerve_w > 0.0:
-            # curvature that is not the raceline's (swerves) excites larger yaw transients than steady cornering
-            ka = ka + self.swerve_w * np.abs(kg - kr)
-        if kyaw is not None:
-            # the referee measures v * r: in trail braking / swerves the body yaws faster than the path turns
-            ka = np.maximum(ka, kyaw)
-        ka = np.maximum(ka, np.maximum(np.concatenate([ka[1:], ka[-1:]]), np.concatenate([ka[:1], ka[:-1]])))
-        vlim = np.minimum(self.v_max, np.sqrt(self.a_lat / np.maximum(ka, 1e-3)))
-        v_end = min(self.v_max, float(self._finterp(self.fvx, st[-1])) * math.sqrt(self.a_lat / 12.0) * self.v_end_scale)
-        vlim[-1] = min(vlim[-1], v_end)
-        # planned profile: backward pass with the steerable deceleration
-        v = _passes(vlim, dpl, self.tab_plan, v0, self.a_acc, ka, float(self.a_lat), float(self.gg), float(self.gg_min))
-        # emergency envelope: stop before unseen path / closed corridor with the larger stable deceleration
-        stop_at = None
-        s_vis = None
-        xs, ys = self._xy(st, d)
-        dx, dy = xs - lx, ys - ly
-        rng = np.hypot(dx, dy)
-        brg = _wrap(np.arctan2(dy, dx) - yaw)
-        b = np.rint((brg - ANG_MIN) / ANG_INC).astype(int)
-        inview = (b >= 1) & (b <= 1078)
-        bb = np.minimum(np.maximum(b, 1), 1078)
-        meas = np.fmin(np.fmin(scan[bb - 1], scan[bb]), scan[bb + 1])      # NaN beams ignored (all three NaN: unseen)
-        vis = (inview & (meas >= rng - self.vis_tol)) | (cum < self.vis_start)
-        bad = np.flatnonzero(~vis)
-        if bad.size:
-            kv = int(bad[0])
-            s_vis = float(st[kv])
-            stop_at = cum[kv] - BOX_FRONT - self.m_vis
-        if s_block is not None:
-            kb = min(int(np.searchsorted(st, s_block)), N)
-            sb = cum[kb] - BOX_FRONT - self.m_blk
-            stop_at = sb if stop_at is None else min(stop_at, sb)
-        if stop_at is not None:
-            env = np.full(N + 1, np.inf)
-            reach = stop_at - cum - v0 * self.t_react
-            # v such that stopping distance(v) <= reach; tabulated inverse of the stopping distance
-            env = np.interp(np.maximum(reach, 0.0), self.tab_dstop, self.tab_v)
-            env[reach <= 0] = 0.0
-            obs_occl = False
-            if self.vis_obs_stop and bad.size:
-                # what hides the first unseen path point?  a wall (blind corner) or an obstacle (a chicane partner may be
-                # right behind it): look at the occluding return of that beam in the wall distance transform
-                bk = int(bb[kv])
-                rk = float(meas[kv])
-                ang = yaw + ANG_MIN + ANG_INC * bk
-                hx, hy = lx + rk * math.cos(ang), ly + rk * math.sin(ang)
-                col = int((hx - self.ox) / self.res)
-                row = int((hy - self.oy) / self.res)
-                if 0 <= col < self.W and 0 <= row < self.H:
-                    obs_occl = bool(self.edt[row, col] > self.obs_edt)
-            if self.v_vis_safe > 0.0 and bad.size and not obs_occl and (s_block is None or s_vis < s_block):
-                # unseen path (not a closed corridor): arrive there no faster than v_vis_safe, from where the car can
-                # still stop within ~d_stop(v_vis_safe) or swerve sharply around whatever appears
-                vs = self.v_vis_safe
-                ds_ = float(np.interp(vs, self.tab_v, self.tab_dstop))
-                reach_v = cum[kv] - BOX_FRONT - self.m_vis - cum - v0 * self.t_react
-                env_v = np.interp(np.maximum(reach_v, 0.0) + ds_, self.tab_dstop, self.tab_v)
-                env_v = np.where(reach_v <= 0.0, np.minimum(env_v, vs), env_v)
-                if s_block is not None:
-                    reach_b = sb - cum - v0 * self.t_react
-                    env_b = np.interp(np.maximum(reach_b, 0.0), self.tab_dstop, self.tab_v)
-                    env_b[reach_b <= 0] = 0.0
-                    env_v = np.minimum(env_v, env_b)
-                env = env_v
-            v = np.minimum(v, env)
-        # forward pass from the current speed; predicted speed (braking limited by the emergency limit)
-        vprof, vpred = _fwd(v, dpl, float(v0), float(self.a_acc_eff), self.tab_emerg)
-        self.vlim0 = float(v[0])
-        acc = np.clip((vpred[1:] ** 2 - vpred[:-1] ** 2) / (2 * dpl), -A_MAX, A_MAX)
+    def _speed_profile(self, st, d, mu, beta, kr, v0, scan, lx, ly, yaw, s_block):
+        """returns (vprof target speeds, vpred predicted speeds, accel per station, dpl, s_vis); compiled in _speed_k,
+        then (obstacle mode) the frontier, em_frac, weave and slow-DP envelopes"""
+        f64 = lambda a: np.ascontiguousarray(a, dtype=np.float64)
+        vprof, vpred, acc, dpl, kv, v0_lim, self._sp_cum = _speed_k(
+            f64(st), f64(d), f64(mu), f64(beta), f64(kr), float(v0), f64(scan), float(lx), float(ly), float(yaw),
+            math.nan if s_block is None else float(s_block), self.fx, self.fy, self.fnx, self.fny, self.fpsi, self.fvx,
+            float(self.L), float(self.fds), float(self.ds), float(self.v_max), float(self.a_lat), float(self.v_end_scale),
+            float(self.a_acc), float(self.vis_tol), float(self.vis_start), float(self.m_vis), float(self.m_blk),
+            float(self.t_react), float(self.v_vis_safe), self.tab_plan, self.tab_emerg, self.tab_dstop, self.tab_v)
+        self.vlim0 = float(v0_lim)
+        s_vis = float(st[kv]) if kv >= 0 else None
+        if not self.obs_on:
+            return vprof, vpred, acc, dpl, s_vis
+        cum = self._sp_cum
+        envs = []                   # the speed envelopes that apply now
+        if self.v_hz >= 0.0:
+            gated = False
+            if self.front_flag is not None:
+                ii = (np.floor(np.mod(st, self.L) / self.fds).astype(np.int64)) % self.nf
+                envs.append(self.front_cap[ii])
+                gated = not bool(self.front_flag[ii[0]])
+            if not gated:
+                envs.append(self._env(cum, cum.size - 1, v0, self.v_hz, self.m_hz))
+        if self.em_frac < 1.0 and s_block is not None:
+            # the closed-corridor envelope again (lag t_react + t_lag, reduced deceleration)
+            kb = min(int(np.searchsorted(st, s_block)), cum.size - 1)
+            envs.append(self._env(cum, kb, v0, 0.0, self.m_blk, self.em_frac))
+        for s_w, s_w2, v_w in self.weaves:
+            k = min(int(np.searchsorted(st, s_w)), cum.size - 1)
+            k2 = int(np.searchsorted(st, s_w2))
+            if k2 > 0:
+                e3 = self._env(cum, k, v0, v_w, -BOX_FRONT)
+                e3[k2 + 1:] = np.inf
+                envs.append(e3)
+        if self.v_slow > 0.0 and self.slow_at is not None:
+            s_t = self.slow_at - self.slow_pre
+            k = min(int(np.searchsorted(st, s_t)), cum.size - 1)
+            e2 = self._env(cum, k, v0, self.v_slow, self.m_slow - BOX_FRONT)
+            e2[(st > s_t + self.slow_len)] = np.inf
+            envs.append(e2)
+        env = np.min(envs, axis=0) if envs else None
+        if env is not None and np.any(env < vprof):
+            vl = np.minimum(vprof, env)
+            vprof, vpred = _fwd(np.ascontiguousarray(vl), np.ascontiguousarray(dpl, dtype=np.float64), float(v0),
+                                float(self.a_acc), self.tab_emerg)
+            acc = np.clip((vpred[1:] ** 2 - vpred[:-1] ** 2) / (2 * dpl), -A_MAX, A_MAX)
+            self.vlim0 = min(self.vlim0, float(vl[0]))
         return vprof, vpred, acc, dpl, s_vis
 
     def _heading(self, s):
-        """raceline heading at s (continuous interpolation)"""
-        if self.jit and isinstance(s, float):
-            u = (s % self.L) / self.fds
-            fu = math.floor(u)
-            i0 = int(fu) % self.nf
-            i1 = (i0 + 1) % self.nf
-            f = u - fu
-            return float(self.fpsi[i0] + _wrap(float(self.fpsi[i1] - self.fpsi[i0])) * f)
-        u = np.mod(np.asarray(s, dtype=float), self.L) / self.fds
-        i0 = np.floor(u).astype(int) % self.nf
+        """raceline heading at the station s (scalar; continuous interpolation)"""
+        u = (s % self.L) / self.fds
+        fu = math.floor(u)
+        i0 = int(fu) % self.nf
         i1 = (i0 + 1) % self.nf
-        f = u - np.floor(u)
-        return self.fpsi[i0] + _wrap(self.fpsi[i1] - self.fpsi[i0]) * f
+        f = u - fu
+        return float(self.fpsi[i0] + _wrap(float(self.fpsi[i1] - self.fpsi[i0])) * f)
 
     # ------------------------------------------------------------------ MPC
-    def _mpc(self, st, X0, Xbar, kr, vpred, acc, dpl, boxes, sides, w_h, s_block, dpath=None):
+    def _mpc(self, st, X0, Xbar, kr, vpred, acc, dpl, boxes, sides, w_h, dpath):
+        """QP data written by _mpc_hp_k straight into HPIPM's buffers; returns (Xs, steering rate, slack, dt) or None"""
         N, nl = self.n, len(self.lpts)
-        if self.jit and self.hp is not None and self.hp_all:
-            # compiled path (same QP): ~10x less time than the numpy construction below, which stays for OSQP
-            hp = self.hp
-            bx = np.array(boxes, dtype=np.float64).reshape(-1, 4)
-            bsd = np.array(sides, dtype=np.int64).reshape(-1)
-            base = dpath if (dpath is not None and self.ref_dp) else np.zeros(N + 1)
-            cmu, lgc, ugc, dt = np.empty((N, nl)), np.empty((N, nl)), np.empty((N, nl)), np.empty(N)
-            f64 = lambda a: np.ascontiguousarray(a, dtype=np.float64)
-            _mpc_hp_k(f64(st), f64(X0), f64(Xbar), f64(kr), f64(vpred), f64(acc), f64(dpl), f64(base), self.lpts_a,
-                      self.wlo_c, self.whi_c, self.nf, self.fds, bx, bsd, float(w_h), float(self.v_min_plan),
-                      float(self.c_pref), float(self.q_d), float(self.q_mu), float(self.q_a), float(self.a_lat_hard),
-                      self.tab_plan, hp.bA, hp.bB, hp.bb, hp.bQ, hp.bq, hp.bC, hp.blg, hp.bug, hp.blbx, hp.bubx,
-                      cmu, lgc, ugc, dt, float(self.c_tyre))
-            status, iters, Xs = hp.solve_all()
-            self.qp_info = (iters, status)
-            if status not in (0, 1) or not np.all(np.isfinite(Xs)):
-                return None
-            return Xs, np.diff(Xs[:, 4]) / dt, _hp_slack_k(Xs, cmu, lgc, ugc), dt
-        vp = np.maximum(vpred, self.v_min_plan)
-        vi = vp[:N]
-        ai = acc
-        dbar, mbar, bbar = Xbar[:, 0], Xbar[:, 1], Xbar[:, 2]
-        chib = mbar + bbar
-        cb, sb = np.cos(chib), np.sin(chib)
-        D = np.maximum(1.0 - kr * dbar, 0.2)
-        dt = dpl / vi
-        a11, a12, b1, a21, a22, b2 = bicycle(vi, ai, self.c_tyre)
-        krr = kr[:N]
-        Ac = np.zeros((N, 7, 7))
-        Ac[:, 0, 1] = vi * cb[:N]
-        Ac[:, 0, 2] = vi * cb[:N]
-        Ac[:, 0, 6] = vi * (sb[:N] - cb[:N] * chib[:N])
-        cd = -krr * krr * vi * cb[:N] / D[:N] ** 2
-        cm = krr * vi * sb[:N] / D[:N]
-        Ac[:, 1, 0] = cd
-        Ac[:, 1, 1] = cm
-        Ac[:, 1, 2] = cm
-        Ac[:, 1, 3] = 1.0
-        Ac[:, 1, 6] = -krr * vi * cb[:N] / D[:N] - cd * dbar[:N] - cm * chib[:N]
-        Ac[:, 2, 2] = a11
-        Ac[:, 2, 3] = a12
-        Ac[:, 2, 4] = b1
-        Ac[:, 3, 2] = a21
-        Ac[:, 3, 3] = a22
-        Ac[:, 3, 4] = b2
-        Ac[:, 4, 5] = 1.0
-        E = _expm_k(np.ascontiguousarray(Ac * dt[:, None, None]))
-        Ad = E[:, :5, :5]
-        Bd = E[:, :5, 5]
-        ed = E[:, :5, 6]
-        Av = self.A_vals.copy()
-        l = np.zeros(self.nrow)
-        u = np.zeros(self.nrow)
-        l[0:5] = X0
-        u[0:5] = X0
-        blk = np.zeros((N, 5, 7))
-        blk[:, :, 0] = 1.0
-        blk[:, :, 1:6] = -Ad
-        blk[:, :, 6] = -Bd
-        Av[self.k_dyn:self.k_dyn + 35 * N] = blk.ravel()
-        r0 = self.row_dyn
-        l[r0:r0 + 5 * N] = ed.ravel()
-        u[r0:r0 + 5 * N] = ed.ravel()
-        # corridor on the collision-box points
-        ii = np.arange(1, N + 1)
-        cmy, smy = np.cos(mbar[ii]), np.sin(mbar[ii])
-        keff = kr[ii] / D[ii]
-        vals = np.zeros((N, nl, 6))
-        lo_all = np.zeros((N, nl))
-        hi_all = np.zeros((N, nl))
-        for j, lp in enumerate(self.lpts):
-            sP = st[ii] + lp * cmy / D[ii]
-            lo, hi = self._corridor(sP, boxes, sides, w_h, s_block)
-            const = lp * (smy - cmy * mbar[ii]) - keff * lp * lp / 2
-            vals[:, j, 0] = 1.0
-            vals[:, j, 1] = lp * cmy
-            vals[:, j, 2] = 1.0
-            vals[:, j, 3] = 1.0
-            vals[:, j, 4] = lp * cmy
-            vals[:, j, 5] = -1.0
-            lo_all[:, j] = lo - const
-            hi_all[:, j] = hi - const
-        Av[self.k_cor:self.k_cor + 6 * nl * N] = vals.ravel()
-        rc = self.row_cor
-        lv = np.zeros((N, nl, 2))
-        uv = np.zeros((N, nl, 2))
-        lv[:, :, 0] = lo_all
-        uv[:, :, 0] = np.inf
-        lv[:, :, 1] = -np.inf
-        uv[:, :, 1] = hi_all
-        l[rc:rc + 2 * nl * N] = lv.ravel()
-        u[rc:rc + 2 * nl * N] = uv.ravel()
-        # steering angle and rate
-        rd = self.row_del
-        l[rd:rd + N] = -STEER_MAX * 0.98
-        u[rd:rd + N] = STEER_MAX * 0.98
-        rw = self.row_w
-        l[rw:rw + N] = -STEER_RATE * 0.95
-        u[rw:rw + N] = STEER_RATE * 0.95
-        rs = self.row_s
-        l[rs:rs + 2 * (N + 1)] = 0.0
-        u[rs:rs + 2 * (N + 1)] = np.inf
-        # lateral acceleration |v r| <= a_lat_hard (soft)
-        rl = self.row_lat
-        vlat = np.zeros((N, 2, 2))
-        vlat[:, 0, 0] = vp[ii]
-        vlat[:, 0, 1] = 1.0
-        vlat[:, 1, 0] = vp[ii]
-        vlat[:, 1, 1] = -1.0
-        Av[self.k_lat:self.k_lat + 4 * N] = vlat.ravel()
-        ll = np.zeros((N, 2))
-        ul = np.zeros((N, 2))
-        ll[:, 0] = -self.a_lat_hard
-        ul[:, 0] = np.inf
-        ll[:, 1] = -np.inf
-        ul[:, 1] = self.a_lat_hard
-        l[rl:rl + 2 * N] = ll.ravel()
-        u[rl:rl + 2 * N] = ul.ravel()
-        # cost
-        lo_a, hi_a = self._corridor(st, boxes, sides, w_h, s_block)
-        lo_b, hi_b = self._corridor(st + BOX_FRONT, boxes, sides, w_h, s_block)
-        lo_c, hi_c = np.maximum(lo_a, lo_b), np.minimum(hi_a, hi_b)
-        base = dpath if (dpath is not None and self.ref_dp) else np.zeros_like(lo_c)
-        dref = np.minimum(np.maximum(base, lo_c + self.c_pref), hi_c - self.c_pref)
-        narrow = (hi_c - lo_c) < 2 * self.c_pref
-        dref[narrow] = 0.5 * (lo_c[narrow] + hi_c[narrow])
-        if self.hp is not None:
-            # lateral-acceleration limit at the slowest speed reachable with planned braking: far away the speed
-            # profile adapts to the path, so only the near part is really constrained
-            v0_ = float(vp[0])
-            cum = np.concatenate([[0.0], np.cumsum(dpl)])
-            vreach = np.sqrt(np.maximum(v0_ * v0_ - 2.0 * self._abrake(self.tab_plan, v0_) * cum, 1.0))
-            vlat = np.minimum(vp, vreach)
-            return self._solve_hpipm(X0, Ad, Bd, ed, vals[:, :, 1], lo_all, hi_all, vp, dref, kr, dt, vlat)
-        Pd = np.full(self.nv, 1e-6)
-        q = np.zeros(self.nv)
-        xi = 5 * ii
-        Pd[xi + 0] = 2 * self.q_d
-        q[xi + 0] = -2 * self.q_d * dref[ii]
-        Pd[xi + 1] = 2 * self.q_mu
-        wa = self.q_a * vp[ii] ** 2
-        Pd[xi + 3] = 2 * wa
-        q[xi + 3] = -2 * wa * vp[ii] * kr[ii]
-        Pd[self.iW0:self.iW0 + N] = 2 * self.r_w
-        Pd[self.iS0:self.iS0 + N + 1] = 2 * self.rho2
-        q[self.iS0:self.iS0 + N + 1] = self.rho1
-        Pd[self.iT0:self.iT0 + N + 1] = 2 * self.rhoa2
-        q[self.iT0:self.iT0 + N + 1] = self.rhoa1
-        if self.qp is None:
-            self._qp_setup(Pd, q, Av, l, u)
-        else:
-            self.qp.update(Px=Pd, q=q, Ax=Av[self.A_perm], l=l, u=u)
-            if self.shift_ws and self.sol is not None and self.z_prev is not None:
-                # warm start: previous primal solution moved to the new stations
-                ss_ = self.sol[0]
-                zp = self.z_prev
-                Xp = zp[:5 * (N + 1)].reshape(N + 1, 5)
-                Xw = np.stack([np.interp(st, ss_, Xp[:, k]) for k in range(5)], 1)
-                Xw[0] = X0
-                ww = np.interp(st[:N], ss_[:N], zp[self.iW0:self.iW0 + N])
-                zw = zp.copy()
-                zw[:5 * (N + 1)] = Xw.ravel()
-                zw[self.iW0:self.iW0 + N] = ww
-                self.qp.warm_start(x=zw)
-        res = self.qp.solve()
-        status = res.info.status_val
-        self.qp_info = (res.info.iter, status)
-        if status not in (1, 2, 7, 8) or res.x is None or not np.all(np.isfinite(res.x)):
-            self.qp = None
-            self.z_prev = None
-            return None
-        self.z_prev = res.x.copy()
-        z = res.x
-        Xs = z[:5 * (N + 1)].reshape(N + 1, 5)
-        w = z[self.iW0:self.iW0 + N]
-        slack = z[self.iS0:self.iS0 + N + 1]
-        return Xs, w, slack, dt
-
-    def _solve_hpipm(self, X0, Ad, Bd, ed, cmu, lo_all, hi_all, vp, dref, kr, dt, vlat):
-        N, nl = self.n, len(self.lpts)
-        Q = np.zeros((N + 1, 5, 5))
-        idx = np.arange(5)
-        wa = self.q_a * vp ** 2
-        diag = np.zeros((N + 1, 5))
-        diag[:, 0] = 2 * self.q_d
-        diag[:, 1] = 2 * self.q_mu
-        diag[:, 2] = 2e-6
-        diag[:, 3] = 2 * wa
-        diag[:, 4] = 2e-6
-        diag[0] = 2e-6
-        Q[:, idx, idx] = diag
-        q = np.zeros((N + 1, 5))
-        q[1:, 0] = -2 * self.q_d * dref[1:]
-        q[1:, 3] = -2 * wa[1:] * vp[1:] * kr[1:]
-        Cm = np.zeros((N + 1, nl + 1, 5))
-        Cm[1:, :nl, 0] = 1.0
-        Cm[1:, :nl, 1] = cmu
-        Cm[1:, nl, 3] = vlat[1:]
-        lg = np.zeros((N + 1, nl + 1))
-        ug = np.zeros((N + 1, nl + 1))
-        lg[1:, :nl] = lo_all
-        ug[1:, :nl] = hi_all
-        lg[1:, nl] = -self.a_lat_hard
-        ug[1:, nl] = self.a_lat_hard
-        bad = lg[1:, :nl] > ug[1:, :nl]          # closed corridor: keep the problem well posed (slack does the rest)
-        if np.any(bad):
-            mid = 0.5 * (lg[1:, :nl] + ug[1:, :nl])
-            lg[1:, :nl] = np.where(bad, mid, lg[1:, :nl])
-            ug[1:, :nl] = np.where(bad, mid, ug[1:, :nl])
-        lbx = np.full((N + 1, 1), -STEER_MAX * 0.98)
-        ubx = np.full((N + 1, 1), STEER_MAX * 0.98)
-        lbu = np.full((N, 1), -STEER_RATE * 0.95)
-        ubu = np.full((N, 1), STEER_RATE * 0.95)
-        if self.hp_all:
-            hp = self.hp
-            hp.bA[:N] = np.transpose(Ad, (0, 2, 1))
-            hp.bB[:N, 0, :] = Bd
-            hp.bb[:N] = ed
-            hp.bQ[:] = Q
-            hp.bq[:] = q
-            hp.bC[:] = np.transpose(Cm, (0, 2, 1))
-            hp.blg[:] = lg
-            hp.bug[:] = ug
-            hp.blbx[0, :5] = X0
-            hp.bubx[0, :5] = X0
-            hp.blbx[1:, 0] = lbx[1:, 0]
-            hp.bubx[1:, 0] = ubx[1:, 0]
-            status, iters, Xs = hp.solve_all()
-        else:
-            status, iters, Xs = self.hp.solve(Ad, Bd[:, :, None], ed, Q, q, Cm, lg, ug, X0, lbx, ubx, lbu, ubu)
+        hp = self.hp
+        bx = np.array(boxes, dtype=np.float64).reshape(-1, 4)
+        bsd = np.array(sides, dtype=np.int64).reshape(-1)
+        base = dpath if self.ref_dp else np.zeros(N + 1)
+        cmu, lgc, ugc, dt = np.empty((N, nl)), np.empty((N, nl)), np.empty((N, nl)), np.empty(N)
+        f64 = lambda a: np.ascontiguousarray(a, dtype=np.float64)
+        _mpc_hp_k(f64(st), f64(X0), f64(Xbar), f64(kr), f64(vpred), f64(acc), f64(dpl), f64(base), self.lpts_a,
+                  self.wlo_c, self.whi_c, self.nf, self.fds, bx, bsd, float(w_h), float(self.v_min_plan),
+                  float(self.c_pref), float(self.q_d), float(self.q_mu), float(self.q_a), float(self.a_lat_hard),
+                  self.tab_plan, hp.bA, hp.bB, hp.bb, hp.bQ, hp.bq, hp.bC, hp.blg, hp.bug, hp.blbx, hp.bubx,
+                  cmu, lgc, ugc, dt, float(self.c_tyre))
+        status, iters, Xs = hp.solve_all()
         self.qp_info = (iters, status)
         if status not in (0, 1) or not np.all(np.isfinite(Xs)):
             return None
-        sl = np.zeros(N + 1)
-        sl[1:] = self._hp_slack(Xs, cmu, lg, ug)
-        return Xs, np.diff(Xs[:, 4]) / dt, sl, dt
-
-    def _hp_slack(self, Xs, cmu, lg, ug):
-        nl = len(self.lpts)
-        val = Xs[1:, 0:1] + cmu * Xs[1:, 1:2]
-        return np.maximum(np.max(lg[1:, :nl] - val, axis=1), np.max(val - ug[1:, :nl], axis=1)).clip(0.0)
+        return Xs, np.diff(Xs[:, 4]) / dt, _hp_slack_k(Xs, cmu, lgc, ugc), dt
 
     # ------------------------------------------------------------------ main
     def act(self, scan, x, y, yaw, v, yaw_rate, t):
@@ -3871,6 +3066,9 @@ class CorridorMPC:
             return steer_h, speed_h
         self.n_invalid = 0
         t = self._clock(t)
+        if self.t_odo is not None and t > self.t_odo:
+            self.odo += abs(v) * min(t - self.t_odo, 0.2)
+        self.t_odo = t
         if np.isneginf(scan).any():
             # REP 117: -inf = closer than range_min (a return at the sensor), +inf = no return (free), NaN = invalid
             scan = np.where(np.isneginf(scan), 0.0, scan)
@@ -3898,12 +3096,9 @@ class CorridorMPC:
             if jump_d > 2.0:
                 # relocated (not a glitch): what was remembered, the side commitments and the latches belong to the
                 # old place / pose (v1's lap-wrap test cleared them on a backward jump, the teleport branch skips it)
-                if self.mem is not None:
-                    self.mem[self.active] = 0
                 self._mem_clear()
                 self.prev_sides = []
                 self.seen_boxes = []
-                self.box_ext = []
                 self.box_conf = []
                 self.conf_idx = {}
         # command history: keep what can still act (largest latency hypothesis) plus the command acting before it
@@ -3911,8 +3106,7 @@ class CorridorMPC:
         while k_old + 1 < len(self.hist) and self.hist[k_old + 1][0] < t - 0.3 - self.lat_max:
             k_old += 1
         self.hist = self.hist[k_old:]
-        self._H = np.array(self.hist, dtype=np.float64).reshape(len(self.hist), 3) if self.jit else None
-        self.a_acc_eff = self.a_acc_launch if (self.a_acc_launch > 0.0 and v < self.v_launch) else self.a_acc
+        self._H = np.array(self.hist, dtype=np.float64).reshape(len(self.hist), 3)
         # call period: median of the recent gaps (a single stall does not change it)
         gap = None if self.t_last_call is None else t - self.t_last_call
         self.t_last_call = t
@@ -3953,15 +3147,16 @@ class CorridorMPC:
         if self.s_prev is not None and self.s_prev - s_c > self.L / 2:
             wrapped = True
             # crossed the finish line: new layout -> forget, ignore the next stale scan(s)
-            if self.mem is not None:
-                self.mem[self.active] = 0
             self._mem_clear()
             self.blind_until = t + self.blind_after_wrap
             self.prev_sides = []
             self.seen_boxes = []
-            self.box_ext = []
             self.box_conf = []
             self.conf_idx = {}
+            if self.obs_mem < 0.0:
+                self.lap_clear = self.lap_boxes == 0 and self.odo > 0.5 * self.L
+                self.lap_boxes = 0
+                self._set_mode(not self.lap_clear)
             if self.sol is not None:
                 self.sol = (self.sol[0] - self.L,) + self.sol[1:]
             if self.prof is not None:
@@ -3995,6 +3190,10 @@ class CorridorMPC:
         self._set_wall(wc_run)
         if do_dp:
             boxes = self._boxes(s0, scan, lx, ly, yaw)
+            if boxes:
+                self.lap_boxes += 1
+                if self.obs_mem != 0.0:
+                    self._set_mode(True)
             firsts = [self._first_seen(0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]), t) for b in boxes]
             self.box_age = [t - f for f in firsts]
             self.seen_boxes = [(0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]), f) for b, f in zip(boxes, firsts)]
@@ -4011,14 +3210,22 @@ class CorridorMPC:
             if flipped:
                 relax = {j for j in range(len(boxes)) for i in flipped if abs(mids[j] - mids[i]) < self.cluster_ds}
                 st, dpath, sides, s_block = self._dp(s0, d0, mu0 + pbeta, boxes, vv, w_h, relax=relax)
-            if s_block is not None and (self.gap_fallback or self.escape):
-                # no complete path: first allow the narrow gaps, then (last resort) release the hard commitments
-                tries = ([(True, False)] if self.gap_fallback else []) + ([(False, True), (False, False)] if self.escape else [])
-                for hard_, gap_ in tries:
-                    r_ = self._dp(s0, d0, mu0 + pbeta, boxes, vv, w_h, relax=relax, hard=hard_, gap=gap_)
+            self.slow_at = None
+            if s_block is not None and self.v_slow > 0.0 and self.obs_on:
+                sb0 = s_block
+                for rel_, gap_ in ((False, True), (True, True), (False, False), (True, False)):
+                    if rel_ and self.slow_commit is None:
+                        continue
+                    r_ = self._dp_slow(s0, d0, mu0 + pbeta, boxes, vv, w_h, relax, gap_, rel_)
                     if r_[3] is None:
                         st, dpath, sides, s_block = r_
+                        self.slow_at = sb0
                         break
+            if s_block is not None and self.gap_fallback:
+                # no complete path: allow the narrow gaps
+                r_ = self._dp(s0, d0, mu0 + pbeta, boxes, vv, w_h, relax=relax, hard=True, gap=False)
+                if r_[3] is None:
+                    st, dpath, sides, s_block = r_
             if s_block is not None:
                 # no complete path: keep every obstacle in the corridor (previous side, else the side the car is on)
                 for bi_, b in enumerate(boxes):
@@ -4029,6 +3236,8 @@ class CorridorMPC:
                     sides[bi_] = prev if prev is not None else (1 if d0 > dc else -1)
             self.prev_sides = [(0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]), sd) for b, sd in zip(boxes, sides) if sd != 0]
             self.dp_res = (boxes, sides, s_block, st, dpath)
+            self.tr_extra = (int(bool(self.obs_on)), None if self.slow_at is None else round(self.slow_at, 2))
+            self.weaves = self._weaves(boxes, sides, w_h, s0) if (self.a_weave > 0.0 and self.obs_on) else []
         else:
             boxes, sides, s_block, st_old, dpath_old = self.dp_res
             st = s0 + self.ds * np.arange(N + 1)
@@ -4046,8 +3255,8 @@ class CorridorMPC:
                 self.plan = new
         plan = self.plan
         # ---- commands from the latest plan (time-shifted when it was computed in an earlier call)
-        Xs, dts, vprof, cum, emergency, slack, s_vis = (plan['Xs'], plan['dts'], plan['vprof'], plan['cum'],
-                                                        plan['emergency'], plan['slack'], plan['s_vis'])
+        Xs, dts, vprof, cum, emergency, slack = (plan['Xs'], plan['dts'], plan['vprof'], plan['cum'],
+                                                 plan['emergency'], plan['slack'])
         shift_t = t - plan['t']
         shift_s = s0 - plan['st'][0]
         s_ahead = max(0.3, vv * 0.10)
@@ -4060,15 +3269,16 @@ class CorridorMPC:
         elif vv > 0.5:
             self.t_stop = None
         creep = self.t_stop is not None and t - self.t_stop > self.creep_after
+        self._creep_blocked = bool(plan['bad'])
+        if self.creep_slack >= 0.0 and slack is not None:
+            near_ = cum <= self.creep_dist
+            if np.any(near_) and float(np.max(slack[near_])) > self.creep_slack:
+                self._creep_blocked = True
         if creep:
             emergency = False
         if emergency:
             a_des = -a_em
         else:
-            # feedback on the measured lateral acceleration (the referee's |v r|): cap the target speed
-            kap_m = abs(yaw_rate) / max(vv, 0.5)
-            if kap_m > 1e-3 and vv > 1.0:
-                v_tgt = min(v_tgt, math.sqrt(self.a_lat_fb / kap_m))
             a_des = (v_tgt * v_tgt - pv * pv) / (2 * s_ahead)
             # accelerating in a corner grows the sideslip and the yaw rate: share the grip
             if a_des > 0:
@@ -4076,7 +3286,7 @@ class CorridorMPC:
                 a_des = min(a_des, self.a_acc * max(self.acc_corner_min, 1.0 - load * load))
             if creep:
                 a_des = (self.creep_v - vv) * 4.0
-            a_des = min(max(a_des, -a_em), self.a_acc_eff)
+            a_des = min(max(a_des, -a_em), self.a_acc)
         dt_c = 0.02 if self.t_prev_cmd is None else min(0.1, max(0.005, t - self.t_prev_cmd))
         j_dn = self.jerk if (self.em_jerk is None or not emergency) else self.em_jerk
         a_des = min(max(a_des, self.a_cmd - j_dn * dt_c), self.a_cmd + self.jerk * dt_c)
@@ -4096,61 +3306,49 @@ class CorridorMPC:
         # the command is the measured speed plus a P-controller offset (<= ~1.3 m/s): a glitched speed sample (fuzz:
         # v = 1e6) went straight to the car.  Never binds in normal driving.
         speed = min(speed, self.v_max + 2.0)
-        # ---- steering: planned angle one control period after the bite time
-        if plan['bad']:
-            # infeasible corridor at this speed: brake and follow the (curvature limited) DP path geometrically
-            ld = max(0.7, 0.3 * vv)
-            sts = plan['st']
-            tx, ty = self._xy(np.array([s0 + ld]), np.interp(np.array([s0 + ld]), sts, plan['dpath']))
-            ax_, ay_ = px + LIDAR_X * 0 * math.cos(pyaw), py
-            alpha = _wrap(math.atan2(float(ty[0]) - ay_, float(tx[0]) - ax_) - pyaw)
-            dist = max(math.hypot(float(tx[0]) - ax_, float(ty[0]) - ay_), 0.3)
-            kap = 2.0 * math.sin(alpha) / dist
-            fac = max(WB + float(k_us(a_des, self.c_tyre)) * vv * vv, 0.3 * WB)
-            steer = kap * fac
-        else:
-            tcum = np.concatenate([[0.0], np.cumsum(dts)])
-            # the command is held until the next call: target the planned angle one (measured) period ahead
-            tq = self.t_period + shift_t
-            steer = float(np.interp(tq, tcum, Xs[:, 4]))
-            if self.gain_comp:
-                # the yaw gain depends strongly on the longitudinal acceleration (load transfer): when the commanded
-                # acceleration differs from the one the plan assumed, scale the steering by the steady-state gain ratio
-                a_pl = float(np.interp(tq, tcum[:-1], plan['acc']))
-                vb2 = vv * vv
-                f_cmd = max(WB + float(k_us(a_des, self.c_tyre)) * vb2, 0.3 * WB)
-                f_pl = max(WB + float(k_us(a_pl, self.c_tyre)) * vb2, 0.3 * WB)
-                steer *= min(max(f_cmd / f_pl, 0.4), 2.0)
+        # ---- steering: planned angle one control period after the bite time (on a bad plan too: the bad flag brakes,
+        # see _plan_rest; the command is held until the next call: target the planned angle one measured period ahead)
+        tcum = np.concatenate([[0.0], np.cumsum(dts)])
+        steer = float(np.interp(self.t_period + shift_t, tcum, Xs[:, 4]))
         steer = min(max(steer, -STEER_MAX), STEER_MAX)
+        veto = self.mu_max > 0.0 and self.obs_on and speed > 0.0 and abs(mu0) > self.mu_max
+        if not veto and self.prox_v > 0.0 and self.obs_on and speed > 0.0 and vv < self.prox_v and not plan['bad']:
+            veto = not self._plan_clear(plan, max(self.creep_chk, self.prox_t * vv), shift_s)
+        if (self.creep_chk > 0.0 and self.creep_slack >= 0.0 and self.obs_on and self._creep_blocked and speed > 0.0
+                and vv < 1.5 and not veto):
+            # checked creep / soft drive-on: only while the measured surfaces stay clear of the body
+            veto = not self._fwd_clear(x, y, yaw, steer, max(self.creep_chk, 0.3 * vv))
+        if veto:
+            self._creep_blocked = True        # no drivable plan (the arc search may take over)
+            speed = 0.0
+            self.a_cmd = min(self.a_cmd, 0.0)
+            if self.t_stop is None and vv < 0.15:
+                self.t_stop = t
+        if self.back_dist > 0.0:
+            if self.n_back and (wrapped or teleport or s_c - self.back_s > 1.5 or s_c < self.back_s - 3.0):
+                self.n_back = 0
+            rc = self._backoff(t, x, y, yaw, v, mu0, s_c)
+            if rc is not None:
+                steer, speed = rc
+                self.a_cmd = 0.0
         self.hist.append((t, steer, speed))
-        if self.dbg is not None:
-            self.dbg.append(dict(t=t, x=x, y=y, v=v, r=yaw_rate, s=s0, d=d0, mu=mu0, beta=pbeta, steer=steer,
-                                 speed=speed, a_des=a_des, boxes=[list(b) for b in boxes], sides=list(sides),
-                                 s_block=s_block, s_vis=s_vis, emergency=emergency, dpath=dpath.tolist(),
-                                 dS=Xs[:, 0].tolist(), st=plan['st'].tolist(), vprof=vprof.tolist(),
-                                 slack=None if slack is None else float(np.max(slack)),
-                                 pred=(px, py, pyaw, pv, pbeta, pr, pdelta), beta_est=self.beta_est,
-                                 delta_est=self.delta_est, qp=self.qp_info, dS_full=Xs[:, 0].tolist(),
-                                 dS_delta=Xs[:, 4].tolist(), mpc=do_mpc, t_lat=self.t_lat, c=self.c_tyre))
         return steer, speed
 
     def _set_wall(self, wc):
         """wall clearance of this call's DP / corridor (and the compiled wall rows of the same value)"""
         self.wc_eff = wc
-        if self.jit:
-            kc = int(round(min(max(wc, 0.0), 0.6) / 0.01))      # the row _wall_bounds uses
-            self.wlo_c = np.ascontiguousarray(self.wlo_tab[kc])
-            self.whi_c = np.ascontiguousarray(self.whi_tab[kc])
+        kc = int(round(min(max(wc, 0.0), 0.6) / 0.01))      # the row _wall_bounds uses
+        self.wlo_c = np.ascontiguousarray(self.wlo_tab[kc])
+        self.whi_c = np.ascontiguousarray(self.whi_tab[kc])
 
     def _plan(self, t, st, X0, dpath, boxes, sides, s_block, w_h, pv, scan, lx, ly, yaw, vv):
         """MPC + speed profile on the current stations; returns the plan used for the commands"""
         N = self.n
-        if (self.jit and self.sol is not None and not self.sol_bad and self.reuse_prof and self.prof is not None
-                and self.acc_model):
+        if self.sol is not None and not self.sol_bad and self.reuse_prof and self.prof is not None:
             sp_, vpp, dplp, vpf = self.prof
             kr, Xbar, dpl, vpred, acc = _plan_prep_k(st, self.fk, float(self.L), float(self.fds), self.sol[0],
                                                      self.sol[1], dpath, X0, sp_, dplp, vpf, float(pv),
-                                                     float(self.a_cmd), float(self.a_acc_eff), float(self.jerk),
+                                                     float(self.a_cmd), float(self.a_acc), float(self.jerk),
                                                      self.tab_emerg, float(self.t_period))
             return self._plan_rest(t, st, X0, dpath, boxes, sides, s_block, w_h, pv, scan, lx, ly, yaw, vv, kr, Xbar,
                                    dpl, vpred, acc)
@@ -4176,13 +3374,10 @@ class CorridorMPC:
         else:
             vtarget, vpred, acc, dpl, s_vis = self._speed_profile(st, Xbar[:, 0], Xbar[:, 1], Xbar[:, 2], kr, pv,
                                                                   scan, lx, ly, yaw, s_block)
-        if self.acc_model:
-            # the speed / acceleration the command logic will really produce (jerk limited, from the current command)
-            cum0 = np.concatenate([[0.0], np.cumsum(dpl)])
-            vpred, acc = _cmd_sim(vtarget.astype(np.float64), cum0, dpl.astype(np.float64), float(pv), float(self.a_cmd),
-                                  float(self.a_acc_eff), float(self.jerk), self.tab_emerg, float(self.t_period))
-        else:
-            vpred, acc = self._stable_accel(vpred, dpl)
+        # the speed / acceleration the command logic will really produce (jerk limited, from the current command)
+        cum0 = np.concatenate([[0.0], np.cumsum(dpl)])
+        vpred, acc = _cmd_sim(vtarget.astype(np.float64), cum0, dpl.astype(np.float64), float(pv), float(self.a_cmd),
+                              float(self.a_acc), float(self.jerk), self.tab_emerg, float(self.t_period))
         return self._plan_rest(t, st, X0, dpath, boxes, sides, s_block, w_h, pv, scan, lx, ly, yaw, vv, kr, Xbar, dpl,
                                vpred, acc)
 
@@ -4190,7 +3385,7 @@ class CorridorMPC:
                    acc):
         N = self.n
         acc_mpc = acc.copy()
-        out = self._mpc(st, X0, Xbar, kr, vpred, acc, dpl, boxes, sides, w_h, s_block, dpath)
+        out = self._mpc(st, X0, Xbar, kr, vpred, acc, dpl, boxes, sides, w_h, dpath)
         slack = None
         if out is not None:
             Xs, w, slack, dts = out
@@ -4199,20 +3394,17 @@ class CorridorMPC:
         else:
             self.n_fail += 1
             Xs, dts = Xbar, dpl / np.maximum(vpred[:N], self.v_min_plan)
-        kyaw = None
-        if self.yaw_lim > 0.0 and out is not None:
-            kyaw = self.yaw_lim * np.abs(Xs[:, 3]) / np.maximum(vpred, self.v_min_plan)
         vprof, vpred, acc, dpl, s_vis = self._speed_profile(st, Xs[:, 0], Xs[:, 1], Xs[:, 2], kr, pv,
-                                                            scan, lx, ly, yaw, s_block, kyaw=kyaw)
-        if self.acc_model and self.resolve_da > 0.0 and out is not None:
+                                                            scan, lx, ly, yaw, s_block)
+        if self.resolve_da > 0.0 and out is not None:
             # the new profile changes the acceleration the car will have near term (e.g. a new swerve starts the
             # braking now): the load transfer then changes the yaw response a lot -> solve once more with it
-            cum1 = self._sp_cum if self.jit and not self.vis_obs_stop else np.concatenate([[0.0], np.cumsum(dpl)])
-            v2, acc2 = _cmd_sim(vprof.astype(np.float64), cum1, dpl.astype(np.float64), float(pv), float(self.a_cmd),
-                                float(self.a_acc_eff), float(self.jerk), self.tab_emerg, float(self.t_period))
+            v2, acc2 = _cmd_sim(vprof.astype(np.float64), self._sp_cum, dpl.astype(np.float64), float(pv),
+                                float(self.a_cmd), float(self.a_acc), float(self.jerk), self.tab_emerg,
+                                float(self.t_period))
             kn = self.resolve_n
             if float(np.max(np.abs(acc2[:kn] - acc_mpc[:kn]))) > self.resolve_da:
-                out2 = self._mpc(st, X0, Xs, kr, v2, acc2, dpl, boxes, sides, w_h, s_block, dpath)
+                out2 = self._mpc(st, X0, Xs, kr, v2, acc2, dpl, boxes, sides, w_h, dpath)
                 if out2 is not None:
                     out = out2
                     Xs, w, slack, dts = out2
@@ -4222,7 +3414,7 @@ class CorridorMPC:
                                                                         scan, lx, ly, yaw, s_block)
                     self.n_resolve += 1
         self.prof = (st, vpred, dpl, vprof)
-        cum = self._sp_cum if self.jit and not self.vis_obs_stop else np.concatenate([[0.0], np.cumsum(dpl)])
+        cum = self._sp_cum
         emergency = False
         bad = out is None or (slack is not None and float(np.max(slack)) > self.slack_bad)
         self.sol_bad = bad
@@ -4246,14 +3438,328 @@ class CorridorMPC:
                 emergency = False
                 vprof = np.minimum(vprof, self.soft_em_v)
         return dict(t=t, st=st, Xs=Xs, dts=dts, vprof=vprof, cum=cum, emergency=emergency, slack=slack, s_vis=s_vis,
-                    bad=bad, dpath=dpath, acc=acc_mpc, failed=out is None)
-
-    def _stable_accel(self, vpred, dpl):
-        """the car cannot brake harder than the (yaw-stable) emergency limit: keep the speed prediction and the
-        acceleration used for the load transfer of the MPC model inside that range"""
-        return _stable_accel_k(vpred.astype(np.float64), dpl.astype(np.float64), self.tab_emerg, float(self.a_acc))
+                    bad=bad, acc=acc_mpc, failed=out is None)
 
     def _dstop(self, v):
         if v <= 0:
             return 0.0
         return float(np.interp(v, self.tab_v, self.tab_dstop)) + v * self.t_react
+
+    # ------------------------------------------------------------------ obstacle options (EXTRA)
+    def _front_tables(self):
+        """static part of the width-gated frontier envelope (see w_front)"""
+        self.front_flag = None
+        if self.w_front <= 0.0 or self.v_hz < 0.0:
+            return
+        W = self.whi_tab[0] - self.wlo_tab[0] + 0.06
+        nf, fds = self.nf, self.fds
+        H = self.n * self.ds
+        nar = W < self.w_front
+        k0, k1 = int(round((H - 0.5) / fds)), int(round((H + self.hz_look) / fds))
+        idx = (np.arange(nf)[:, None] + np.arange(k0, k1 + 1)[None, :]) % nf
+        self.front_flag = nar[idx].any(1)
+        # the envelope's value with a straight horizon of length H (obstacle-mode t_react)
+        tr = self.obs_kw.get('t_react', self.t_react)
+        vs = self.tab_v
+        reach = H - BOX_FRONT - self.m_hz - vs * (tr + self.t_lag) + float(np.interp(self.v_hz, vs, self.tab_dstop))
+        ok = self.tab_dstop <= reach
+        v_fc = float(vs[ok][-1]) if ok.any() else self.v_hz
+        cap = np.where(self.front_flag, v_fc, np.inf)
+        for _ in range(2):
+            for i in range(nf - 1, -1, -1):
+                cap[i] = min(cap[i], math.sqrt(cap[(i + 1) % nf] ** 2 + 2.0 * self.front_ramp * fds))
+        self.front_cap = cap
+        self.v_fc = v_fc
+
+    def _set_mode(self, on):
+        if on == self.obs_on:
+            return
+        self.obs_on = on
+        for k, v in (self.obs_kw if on else self.base_kw).items():
+            setattr(self, k, v)
+            self.p[k] = v
+
+    def _env(self, cum, k, v0, vt, m, frac=1.0):
+        """speed envelope: reach vt at path length cum[k] - BOX_FRONT - m with the emergency deceleration (command lag
+        included), vt beyond"""
+        reach = cum[k] - BOX_FRONT - m - cum - v0 * (self.t_react + self.t_lag)
+        tds = self.tab_dstop / frac
+        ds_ = float(np.interp(vt, self.tab_v, tds))
+        env = np.interp(np.maximum(reach, 0.0) + ds_, tds, self.tab_v)
+        return np.where(reach <= 0.0, np.minimum(env, vt), env)
+
+    def _weaves(self, boxes, sides, w_h, s0):
+        """(s, v): speed caps at the end of the first box of every opposite-side pair (see a_weave)"""
+        out = []
+        bs = sorted((b, sd) for b, sd in zip(boxes, sides) if sd != 0 and b[1] > s0)
+        for (b1, s1), (b2, s2) in zip(bs[:-1], bs[1:]):
+            if s1 == s2 or b2[0] - b1[1] > 4.0:
+                continue
+            # body-line bound past box 1 and the one needed at box 2 (s1 = +1: d >= b[3] + w_h, -1: d <= b[2] - w_h)
+            d1 = b1[3] + w_h if s1 > 0 else b1[2] - w_h
+            d2 = b2[3] + w_h if s2 > 0 else b2[2] - w_h
+            dd = (d2 - d1) * s2
+            if dd <= 0.0:
+                continue
+            ln = max(b2[0] - b1[1] + 0.3, 0.3)
+            kap = 4.0 * dd / (ln * ln)
+            v_w = max(math.sqrt(self.a_weave / kap), self.v_weave_min)
+            out.append((b1[1] - self.weave_pre, b2[0], v_w))
+        return out
+
+    def _dp_slow(self, s0, d0, chi0, boxes, v, w_h, relax, gap, release=False):
+        sv = (self.dp_vfloor, self.dp_vmax, self.dp_kcap, self.dp_adec, self.dp_kmax, self.commit_d, self.commit_t)
+        self.dp_vfloor, self.dp_vmax, self.dp_kcap, self.dp_adec = self.v_slow, 99.0, self.kcap_slow, self.dp_adec_slow
+        self.dp_kmax = self.kmax_slow
+        sv_alh = self.a_lat_hard
+        if self.a_lat_slow > 0.0:
+            self.a_lat_hard = min(self.a_lat_hard, self.a_lat_slow)
+        if release:
+            # shorter hard-commit distance: a committed side may be released further out than commit_d / commit_t v
+            self.commit_d, self.commit_t = self.slow_commit
+        try:
+            return self._dp(s0, d0, chi0, boxes, v, w_h, relax=relax, hard=True, gap=gap)
+        finally:
+            (self.dp_vfloor, self.dp_vmax, self.dp_kcap, self.dp_adec, self.dp_kmax, self.commit_d,
+             self.commit_t) = sv
+            self.a_lat_hard = sv_alh
+
+    def _close_narrow(self, s0, boxes, v, w_h):
+        """boxes for the DP with the narrow side of a box closed when the other side is clearly wider (g_narrow,
+        g_diff; DP only: the corridor of the chosen side is built from the real box)"""
+        dnear = max(self.commit_d, self.commit_t * v)
+        bx2 = []
+        for b in boxes:
+            b2 = list(b)
+            ss = np.linspace(b[0], b[1], 5)
+            wlo, whi = self._wall_bounds(ss, self.wc_eff)
+            g_hi = float(np.min(whi)) - (b[3] + w_h)
+            g_lo = (b[2] - w_h) - float(np.max(wlo))
+            prev = self._prev_side(0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]))
+            dist = b[0] - (s0 + BOX_FRONT)
+            near = dist < dnear and v > self.hard_block_v
+            if g_hi < self.g_narrow and g_lo > g_hi + self.g_diff and not (near and prev == 1):
+                b2[3] = float(np.max(whi)) + 0.5
+            elif g_lo < self.g_narrow and g_hi > g_lo + self.g_diff and not (near and prev == -1):
+                b2[2] = float(np.min(wlo)) - 0.5
+            bx2.append(b2)
+        return bx2
+
+    def _body_clr(self, x, y, yaw, dl, dist):
+        """smallest clearance of the body points (rear / middle / front corners) to the map walls and to the
+        remembered obstacle cells after reversing dist m with steering dl (kinematic arc; dist 0: current pose)"""
+        sb = dist
+        yw = yaw - sb * math.tan(dl) / WB
+        ym = 0.5 * (yaw + yw)
+        cx, cy = x - sb * math.cos(ym), y - sb * math.sin(ym)
+        c, s_ = math.cos(yw), math.sin(yw)
+        P = np.array([(cx + lx_ * c - ly_ * s_, cy + lx_ * s_ + ly_ * c)
+                      for lx_, ly_ in BODY_PTS])
+        cw = float(np.min(self._clearance(P[:, 0], P[:, 1])))
+        co = math.inf
+        if self.active.size:
+            dx = self.act_x[:, None] - P[None, :, 0]
+            dy = self.act_y[:, None] - P[None, :, 1]
+            co = math.sqrt(float(np.min(dx * dx + dy * dy)))
+        return cw, co
+
+    def _plan_clear(self, plan, dist, shift):
+        """body points along the planned path (d, mu at the stations within dist m of path ahead) keep creep_m_obs /
+        creep_m_wall from the measured obstacle cells / walls"""
+        st, Xs, cum = plan['st'], plan['Xs'], plan['cum']
+        c0 = float(np.interp(shift, st - st[0], cum)) if shift > 0 else 0.0
+        k = np.flatnonzero((cum >= c0) & (cum <= c0 + dist))
+        if k.size == 0:
+            return True
+        xs, ys = self._xy(st[k], Xs[k, 0])
+        hd = np.array([self._heading(float(q)) for q in st[k]]) + Xs[k, 1]
+        c, s_ = np.cos(hd), np.sin(hd)
+        pts = []
+        for lx_, ly_ in FRONT_PTS:
+            pts.append(np.stack([xs + lx_ * c - ly_ * s_, ys + lx_ * s_ + ly_ * c], 1))
+        P = np.concatenate(pts)
+        if float(np.min(self._clearance(P[:, 0], P[:, 1]))) < self.creep_m_wall:
+            return False
+        if self.active.size:
+            dx = self.act_x[:, None] - P[None, :, 0]
+            dy = self.act_y[:, None] - P[None, :, 1]
+            if float(np.min(dx * dx + dy * dy)) < self.creep_m_obs ** 2:
+                return False
+        return True
+
+    def _fwd_clear(self, x, y, yaw, dl, dist):
+        """the body stays creep_m_obs / creep_m_wall clear when driving dist m forward with steering dl"""
+        for i in (1, 2, 3):
+            cw, co = self._body_clr(x, y, yaw, dl, -dist * i / 3)
+            if cw < self.creep_m_wall or co < self.creep_m_obs:
+                return False
+        return True
+
+    # ---- low-speed manoeuvre (arc search)
+    @staticmethod
+    def _arc(x, y, yaw, dr, dl, u):
+        """pose after the signed arc length dr * u with steering dl (exact circle; broadcasting)"""
+        th = dr * u * np.tan(dl) / WB
+        c = dr * u * np.sinc(0.5 * th / np.pi)
+        return x + c * np.cos(yaw + 0.5 * th), y + c * np.sin(yaw + 0.5 * th), yaw + th
+
+    def _obs_field(self, x, y):
+        """distance field of the remembered obstacle cells, 7 m square around the car, aligned with the memory grid"""
+        res, half = self.mres, 3.5
+        n = int(2 * half / res)
+        gx = self.ox + math.floor((x - half - self.ox) / res) * res
+        gy = self.oy + math.floor((y - half - self.oy) / res) * res
+        occ = np.zeros((n, n), dtype=bool)
+        if self.active.size:
+            ci = np.floor((self.act_x - gx) / res).astype(np.int64)
+            ri = np.floor((self.act_y - gy) / res).astype(np.int64)
+            ok = (ci >= 0) & (ci < n) & (ri >= 0) & (ri < n)
+            occ[ri[ok], ci[ok]] = True
+        if not occ.any():
+            return None
+        return (ndimage.distance_transform_edt(~occ) * res).astype(np.float32), gx, gy, res
+
+    def _clr(self, X, Y, YAW, fld):
+        """smallest wall and obstacle clearance of the body points of every pose"""
+        c, s = np.cos(YAW)[..., None], np.sin(YAW)[..., None]
+        PX = X[..., None] + self._bpx * c - self._bpy * s
+        PY = Y[..., None] + self._bpx * s + self._bpy * c
+        cw = self._clearance(PX.ravel(), PY.ravel()).reshape(PX.shape).min(-1)
+        if fld is None:
+            return cw, np.full(cw.shape, 9.0)
+        d, gx, gy, res = fld
+        co = ndimage.map_coordinates(d, [(PY.ravel() - gy) / res - 0.5, (PX.ravel() - gx) / res - 0.5], order=1,
+                                     mode='constant', cval=9.0).reshape(PX.shape).min(-1)
+        return cw, co
+
+    def _track(self, I0, X, Y):
+        """line index of the last sample of every rollout, tracked sample by sample from I0 (+-0.3 m per 5 cm step)"""
+        w = np.arange(-6, 7)
+        I = np.broadcast_to(I0[:, None], X.shape[:2]).copy()
+        for k in range(X.shape[2]):
+            cand = (I[..., None] + w) % self.nf
+            d2 = (X[..., k, None] - self.fx[cand]) ** 2 + (Y[..., k, None] - self.fy[cand]) ** 2
+            I = np.take_along_axis(cand, np.argmin(d2, -1)[..., None], -1)[..., 0]
+        return I
+
+    def _s_at(self, i, x, y):
+        return self.fs[i] + (x - self.fx[i]) * self.ftx[i] + (y - self.fy[i]) * self.fty[i]
+
+    def _man_search(self, x, y, yaw):
+        t0 = time.perf_counter()
+        fld = self._obs_field(x, y)
+        P = self._prims
+        cw0, co0 = self._clr(np.array([x]), np.array([y]), np.array([yaw]), fld)
+        fw = min(self.man_m_wall, max(float(cw0[0]) - self.man_close, self.man_close))
+        fo = min(self.man_m_obs, max(float(co0[0]) - self.man_close, self.man_close))
+        g = self.fi if self.fi is not None else int(np.argmin((self.fx - x) ** 2 + (self.fy - y) ** 2))
+        win = (g + np.arange(-40, 41)) % self.nf
+        i0 = int(win[np.argmin((self.fx[win] - x) ** 2 + (self.fy[win] - y) ** 2)])
+        s0 = float(self._s_at(i0, x, y))
+        F = dict(x=np.array([x]), y=np.array([y]), w=np.array([yaw]), i=np.array([i0]), m=np.array([np.inf]),
+                 ln=np.array([0.0]))
+        seqs, cands, n_eval = [()], [], 0
+        for depth in range(3):
+            q = np.flatnonzero(P[:, 0] > 0) if depth == 2 else np.arange(len(P))
+            K = int(math.ceil(float(P[q, 2].max()) / 0.05))
+            u = np.minimum(np.arange(1, K + 1)[None, :] * 0.05, P[q, 2:3])
+            X, Y, W = self._arc(F['x'][:, None, None], F['y'][:, None, None], F['w'][:, None, None],
+                                P[None, q, 0:1], P[None, q, 1:2], u[None])
+            n_eval += X.shape[0] * X.shape[1]
+            cw, co = self._clr(X, Y, W, fld)
+            m = np.minimum(np.minimum(cw - fw, co - fo).min(-1), F['m'][:, None])
+            a, b = np.nonzero(m >= 0.0)
+            if not a.size:
+                break
+            I = self._track(F['i'][a], X[a, b][:, None], Y[a, b][:, None])[:, 0]
+            xe, ye, we, me = X[a, b, -1], Y[a, b, -1], W[a, b, -1], m[a, b]
+            ln = F['ln'][a] + P[q[b], 2]
+            ds = (self._s_at(I, xe, ye) - s0 + 0.5 * self.L) % self.L - 0.5 * self.L
+            mu = _wrap(we - self.fpsi[I])
+            sc = (np.minimum(ds, self.man_goal) - self.man_w_len * ln - self.man_w_mu * np.abs(mu)
+                  + self.man_w_clr * np.minimum(me, 0.1))
+            fwd = P[q[b], 0] > 0
+            for k in np.flatnonzero(fwd & (ds >= self.man_min_prog)):
+                cands.append((float(sc[k]), float(ds[k]), seqs[a[k]] + (int(q[b[k]]),)))
+            keep = np.arange(a.size) if depth == 0 else np.argsort(-(ds - 0.3 * ~fwd))[:self.man_beam]
+            F = dict(x=xe[keep], y=ye[keep], w=we[keep], i=I[keep], m=me[keep], ln=ln[keep])
+            seqs = [seqs[a[k]] + (int(q[b[k]]),) for k in keep]
+        best = max(cands) if cands else None
+        self.man_stats.append(dict(ms=round((time.perf_counter() - t0) * 1e3, 1), n=n_eval, valid=len(cands),
+                                   fw=round(fw, 3), fo=round(fo, 3),
+                                   best=None if best is None else (round(best[0], 3), round(best[1], 3),
+                                                                   [tuple(round(float(v), 3) for v in P[j]) for j in best[2]])))
+        return None if best is None else ([tuple(float(v) for v in P[j]) for j in best[2]], fw, fo)
+
+    def _arc_clear(self, x, y, yaw, dr, dl, rem):
+        """the rest of the current arc keeps the search's floors (- man_tol) with the cells seen now"""
+        if rem <= 0.02:
+            return True
+        u = np.minimum(np.arange(1, int(math.ceil(rem / 0.05)) + 1) * 0.05, rem)
+        cw, co = self._clr(*self._arc(x, y, yaw, dr, dl, u), self._obs_field(x, y))
+        M = self.man
+        return bool(np.all(cw >= M['fw'] - self.man_tol) and np.all(co >= M['fo'] - self.man_tol))
+
+    def _end(self, t_stop):
+        self.man = None
+        self.tr_mode = None
+        self.t_stop = t_stop
+
+    def _backoff(self, t, x, y, yaw, v, mu, s_c):
+        M = self.man
+        if M is None:
+            self.tr_mode = None
+            if v < -0.03:
+                # still reversing after an aborted / timed-out manoeuvre: brake (0.8, as the old back-off did; the
+                # pipeline never commands reverse, and a speed >= 0 command alone brakes a reversing car only gently)
+                return (self.hist[-1][1] if self.hist else 0.0), 0.8
+            if not (self.t_stop is not None and t - self.t_stop > self.back_after and abs(v) < 0.1
+                    and self.n_back < self.back_max):
+                return None
+            res = self._man_search(x, y, yaw)
+            if res is None:
+                self.t_stop = t               # nothing found: wait back_after s, then search again
+                return None
+            self.man = M = dict(seq=res[0], k=0, phase=0, fw=res[1], fo=res[2])
+            if self.n_back == 0:
+                self.back_s = s_c
+            self.n_back += 1
+            self.n_back_tot += 1
+        dr, dl, ln = M['seq'][M['k']]
+        if M['phase'] == 0:
+            # stop, then turn the wheels at standstill (servo 3.2 rad/s + latency)
+            if abs(v) > 0.03:
+                return dl, (0.8 if v < 0 else 0.0)
+            prev = self.hist[-1][1] if self.hist else 0.0
+            M.setdefault('ts', t + abs(dl - prev) / STEER_RATE + 0.08)
+            if t < M['ts']:
+                self.tr_mode = ('settle', M['k'])
+                return dl, 0.0
+            M.update(phase=1, x0=x, y0=y, yaw0=yaw, t1=t)
+        k = math.tan(dl) / WB
+        rem = ln - (abs(_wrap(yaw - M['yaw0'])) / abs(k) if abs(k) > 0.05 else math.hypot(x - M['x0'], y - M['y0']))
+        if t - M['t1'] > 2.0 * ln / self.man_v + 1.5:
+            self._end(t)                      # timeout: stop, search again
+            return dl, (0.8 if v < -0.03 else 0.0)      # brake a reversing car (see above)
+        if rem <= 0.01:
+            M.update(k=M['k'] + 1, phase=0)
+            M.pop('ts', None)
+            M.pop('t_happy', None)
+            if M['k'] >= len(M['seq']):
+                self._end(None)               # last (forward) arc done: the MPC takes over
+                return None
+            return self._backoff(t, x, y, yaw, v, mu, s_c)
+        if dr > 0 and self.man_happy >= 0.0:
+            # early hand-back: the MPC (planned every call from the current state) has a drivable plan again
+            if not self._creep_blocked and not self.plan['emergency']:
+                if t - M.setdefault('t_happy', t) >= self.man_happy:
+                    self._end(None)
+                    return None
+            else:
+                M.pop('t_happy', None)
+        if not self._arc_clear(x, y, yaw, dr, dl, rem):
+            self._end(t)
+            self._creep_blocked = True
+            return dl, (0.8 if v < -0.03 else 0.0)
+        self.tr_mode = ('drive', M['k'])
+        return dl, (self.man_vf if dr > 0 else -self.man_v)
