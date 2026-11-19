@@ -39,7 +39,8 @@ Pipeline per act():
   2. perception: scan hits -> map frame; hits farther than `obs_edt` from any occupied map cell
      (distance transform of hyhall12_orig) are obstacle cells.  Lap-scoped memory (cleared when s wraps,
      with a short blind window for the stale scan) and free-space carving of cells the beams see through.
-     Cells are clustered; each cluster becomes a Frenet box, completed for the hidden back side.
+     Cells are clustered; each cluster becomes a Frenet box of its measured extent (no obstacle size is assumed;
+     see 'Size-free boxes' below).
   3. DP over a Frenet grid picks one consistent side for every visible obstacle (all of them, not only
      the closest), with a side-flip penalty (hysteresis) that becomes almost hard close to the obstacle.
      The chosen sides define an exact corridor lb(s) <= d <= ub(s) for the body line (obstacle and wall
@@ -60,7 +61,8 @@ Changes of the second development round (see work/corridor_mpc/):
     made the predicted yaw rate 30-45 % wrong in corner entries; fixing it gave -0.3 s per lap at lower p99 |v r|.
   * occl_fix: lateral edges of a cluster are told apart by beam order; an edge hidden behind something closer is
     extended to the largest footprint until it is seen free (a single visible cell used to be extended the wrong
-    way, the hidden side of the second obstacle of a chicane was missed).
+    way, the hidden side of the second obstacle of a chicane was missed).  Removed on 2026-11-19 with the size priors
+    (below).
   * min_gap_w: an obstacle side whose corridor to the wall is narrower than 6 cm is not offered to the DP (such
     gaps open and close with every 2 cm of the estimate and caused late side flips); fallback without the rule.
   * em_jerk: emergency braking is not jerk limited.
@@ -87,7 +89,8 @@ transcendental functions; the numpy reference code is kept only in the frozen co
     with the sorted ids (_merge_k / _carve_k: no map-sized gathers, no sort-based set operations per call, no
     map-sized count grid to allocate in reset()); the cells' view of the scan is computed once per call (numpy,
     float32 as before) for carving and _boxes; selection, clustering and per-cluster statistics in _boxes_k.
-  * lookups in box_conf (grows over the lap), prev_sides and seen_boxes are bucketed by s instead of linear scans.
+  * lookups in box_conf (grows over the lap; removed with the size priors on 2026-11-19), prev_sides and
+    seen_boxes are bucketed by s instead of linear scans.
   The QP is still solved by HPIPM with the same settings: the commands stay within ~3e-9 of the reference code (a
   few transcendental functions differ in the last bits).  Closed loop (16 seeds x 3 laps): nominal, lat50 and hz20
   episodes are identical to the reference code; long map episodes drift apart late (lap times +-0.1 s, chaotic
@@ -214,6 +217,22 @@ were tested but not tuned for.
     the front corner touched walls the plan cleared by a few cm).
   * min_gap_keep: hysteresis of min_gap_w for the side already chosen (a narrow gap that shrank by 3 cm at 8 m/s
     forced a flip 4 m before the obstacle).
+
+Size-free boxes (2026-11-19, work/advice_fix/sizefree).  The boxes used three numbers copied from the race manager's
+0.30 m cubes: hidden_depth 0.43 (= 0.30 sqrt 2: unseen back side), w_max 0.43 (a lateral edge hidden behind something
+closer was extended to this width until seen free) and min_width 0.30.  They are gone (passing them raises KeyError).
+A box is the measured extent of its remembered cells (+ half a memory cell, + obs_pad_s / obs_pad_d), at least ds long
+(the MPC station spacing: its sampled corridor constraints could step over a shorter box).  What the scan has not seen
+is not filled in: a path point the scan cannot see (behind or beside an obstacle) is limited by the sight envelope
+(v_vis_safe), like any other unseen part of the track, and the box grows as the beams reach more of the object.
+The occlusion latch that applied w_max (beam order, box_conf) went with it.
+Cost (LiDAR-OBS, harness live-like timing, fresh seeds 1400-1499 x 3 laps, 0.30 m cubes, o4 + o5 = 600 laps, paired
+by lap index against the version with the priors): lap time equal (mean -0.07 / -0.11 s, median 0.000), collisions 3
+(1 obstacle, 2 wall) against 0; screening seeds 1600-1659: 2 against 2; other sizes / planks (seeds 1700-1719, 300
+laps) 4 against 1.  The priors made every box at least as large as a 0.30 m cube; that margin also covered the gap of
+the 3-point MPC corridor at large heading angles next to a box corner (most of the extra obstacle hits are in the
+s 22-26 hairpin chicane with the box measured to a few cm).  Rules that keep unseen space occupied until the beams
+have passed it (behind / beside the box, lap-scoped free-space grid) cost 0.14-1.4 s per lap and were not taken.
 """
 import json
 import math
@@ -1155,145 +1174,20 @@ def _dp_sides_k(sd, dpath_dp, reach, bx, half):
 
 
 @njit(cache=True)
-def _psum32_blk(a, lo, n):
-    """np.add.reduce of float32 a[lo:lo+n], n <= 128, in numpy's order (sequential below 8, else 8 partial sums)"""
-    if n < 8:
-        res = np.float32(0.0)
-        for i in range(lo, lo + n):
-            res = np.float32(res + a[i])
-        return res
-    r = np.empty(8, np.float32)
-    for j in range(8):
-        r[j] = a[lo + j]
-    i = 8
-    m = n - (n % 8)
-    while i < m:
-        for j in range(8):
-            r[j] = np.float32(r[j] + a[lo + i + j])
-        i += 8
-    res = np.float32(np.float32(np.float32(r[0] + r[1]) + np.float32(r[2] + r[3])) +
-                     np.float32(np.float32(r[4] + r[5]) + np.float32(r[6] + r[7])))
-    while i < n:
-        res = np.float32(res + a[lo + i])
-        i += 1
-    return res
-
-
-@njit(cache=True)
-def _psum32(a, lo, n):
-    """np.add.reduce of float32 a[lo:lo+n] (n <= 8192) in numpy's order: blocks of <= 128, larger ranges split in two
-    halves (multiple of 8) and summed recursively; evaluated with an explicit stack (cached numba functions must
-    not be recursive)"""
-    if n <= 128:
-        return _psum32_blk(a, lo, n)
-    s_lo = np.empty(64, np.int64)
-    s_n = np.empty(64, np.int64)
-    s_state = np.zeros(64, np.int64)
-    s_val = np.zeros(64, np.float32)
-    s_lo[0] = lo
-    s_n[0] = n
-    sp = 1
-    ret = np.float32(0.0)
-    while sp > 0:
-        t = sp - 1
-        nn = s_n[t]
-        if nn <= 128:
-            ret = _psum32_blk(a, s_lo[t], nn)
-            sp -= 1
-            continue
-        n2 = nn // 2
-        n2 -= n2 % 8
-        if s_state[t] == 0:
-            s_state[t] = 1
-            s_lo[sp] = s_lo[t]
-            s_n[sp] = n2
-            s_state[sp] = 0
-            sp += 1
-        elif s_state[t] == 1:
-            s_val[t] = ret
-            s_state[t] = 2
-            s_lo[sp] = s_lo[t] + n2
-            s_n[sp] = nn - n2
-            s_state[sp] = 0
-            sp += 1
-        else:
-            ret = np.float32(s_val[t] + ret)
-            sp -= 1
-    return ret
-
-
-@njit(cache=True)
-def _clusters_k(labels, nc, rel, dd, seen, brg, bi, rng, scan):
-    """per cluster of _boxes: extent of the cells (rel s, d), and of the cells the current scan sees: count, mean
-    bearing (numpy's float32 mean) and whether the beams just beyond the lowest / highest beam index return
-    something closer (edge hidden, see _extent_fix)"""
+def _clusters_k(labels, nc, rel, dd):
+    """per cluster of _boxes: extent of the cells (rel s, d)"""
     n = labels.shape[0]
-    start = np.zeros(nc + 1, np.int64)
-    for i in range(n):
-        start[labels[i] + 1] += 1
-    for c in range(nc):
-        start[c + 1] += start[c]
-    order = np.empty(n, np.int64)
-    pos = start[:nc].copy()
+    rmin = np.full(nc, np.inf, np.float32)
+    rmax = np.full(nc, -np.inf, np.float32)
+    dmin = np.full(nc, np.inf, np.float32)
+    dmax = np.full(nc, -np.inf, np.float32)
     for i in range(n):
         c = labels[i]
-        order[pos[c]] = i
-        pos[c] += 1
-    rmin = np.empty(nc, np.float32)
-    rmax = np.empty(nc, np.float32)
-    dmin = np.empty(nc, np.float32)
-    dmax = np.empty(nc, np.float32)
-    nseen = np.zeros(nc, np.int64)
-    bmean = np.zeros(nc, np.float32)
-    occl = np.zeros((nc, 2), np.int8)       # 0 edge seen free, 1 hidden, 2 no information (only NaN beams)
-    buf = np.empty(max(n, 1), np.float32)
-    for c in range(nc):
-        i0 = order[start[c]]
-        rmin[c] = rel[i0]
-        rmax[c] = rel[i0]
-        dmin[c] = dd[i0]
-        dmax[c] = dd[i0]
-        ns = 0
-        ie_lo = -1
-        ie_hi = -1
-        for t in range(start[c], start[c + 1]):
-            i = order[t]
-            rmin[c] = min(rmin[c], rel[i])
-            rmax[c] = max(rmax[c], rel[i])
-            dmin[c] = min(dmin[c], dd[i])
-            dmax[c] = max(dmax[c], dd[i])
-            if seen[i]:
-                buf[ns] = brg[i]
-                ns += 1
-                if ie_lo < 0 or bi[i] < bi[ie_lo]:
-                    ie_lo = i
-                if ie_hi < 0 or bi[i] > bi[ie_hi]:
-                    ie_hi = i
-        nseen[c] = ns
-        if ns == 0:
-            continue
-        bmean[c] = np.float32(np.float64(_psum32(buf, 0, ns)) / ns)
-        for side in range(2):
-            ie = ie_lo if side == 0 else ie_hi
-            step = -1 if side == 0 else 1
-            b0 = bi[ie]
-            cnt = 0
-            nnan = 0
-            mn = np.inf
-            for k in range(1, 4):
-                bb = b0 + step * k
-                if 0 <= bb <= 1079:
-                    cnt += 1
-                    sv = scan[bb]
-                    if sv != sv:
-                        nnan += 1
-                    elif sv < mn:
-                        mn = sv
-            if cnt == 3 and nnan == 3:
-                occl[c, side] = 2
-            elif cnt < 3 or mn < np.float64(rng[ie]) - 0.05:
-                occl[c, side] = 1
-    return rmin, rmax, dmin, dmax, nseen, bmean, occl
+        rmin[c] = min(rmin[c], rel[i])
+        rmax[c] = max(rmax[c], rel[i])
+        dmin[c] = min(dmin[c], dd[i])
+        dmax[c] = max(dmax[c], dd[i])
+    return rmin, rmax, dmin, dmax
 
 
 @njit(cache=True)
@@ -1449,10 +1343,10 @@ def _plan_prep_k(st, fk, L, fds, sol_st, sol_X, dpath, X0, prof_s, prof_dpl, pro
 
 
 @njit(cache=True)
-def _boxes_k(active, act_ok, act_s, act_x, act_y, act_d, v_rng, v_brg, v_bi, scan, MW, W, s_car, L, win_hi, link):
-    """the cell selection and clustering of CorridorMPC._boxes on the compact remembered set, same operations
-    (float32 like numpy): cells with map ok, one per 2x2 block above 400 cells (first occurrence), planning window
-    in s, single-linkage clusters numbered like np.unique of their roots; then _clusters_k"""
+def _boxes_k(active, act_ok, act_s, act_x, act_y, act_d, MW, W, s_car, L, win_hi, link):
+    """the cell selection and clustering of CorridorMPC._boxes on the compact remembered set (float32 like numpy):
+    cells with map ok, one per 2x2 block above 400 cells (first occurrence), planning window in s, single-linkage
+    clusters numbered like np.unique of their roots; then the extent per cluster (_clusters_k)"""
     n = active.shape[0]
     pos = np.empty(n, np.int64)
     m = 0
@@ -1486,25 +1380,15 @@ def _boxes_k(active, act_ok, act_s, act_x, act_y, act_d, v_rng, v_brg, v_bi, sca
     pos = pos[:k]
     rel = rel[:k]
     if k == 0:
-        return _clusters_k(np.zeros(0, np.int64), 0, rel, rel, np.zeros(0, np.bool_), rel, np.zeros(0, np.int64), rel,
-                           scan)
+        return _clusters_k(np.zeros(0, np.int64), 0, rel, rel)
     xs = np.empty(k)
     ys = np.empty(k)
     dd = np.empty(k, np.float32)
-    rng = np.empty(k, np.float32)
-    brg = np.empty(k, np.float32)
-    bi = np.empty(k, np.int64)
-    seen = np.empty(k, np.bool_)
     for i in range(k):
         j = pos[i]
         xs[i] = act_x[j]
         ys[i] = act_y[j]
         dd[i] = act_d[j]
-        rng[i] = v_rng[j]
-        brg[i] = v_brg[j]
-        bi[i] = v_bi[j]
-        bic = min(max(bi[i], 0), 1079)
-        seen[i] = bi[i] >= 0 and bi[i] <= 1079 and abs(scan[bic] - np.float64(rng[i])) < 0.08
     roots = _cluster_k(xs, ys, link) if k > 1 else np.zeros(1, np.int64)
     # labels as np.unique(roots, return_inverse=True): rank of the root among the distinct roots
     rs = np.unique(roots)
@@ -1512,7 +1396,7 @@ def _boxes_k(active, act_ok, act_s, act_x, act_y, act_d, v_rng, v_brg, v_bi, sca
     labels = np.empty(k, np.int64)
     for i in range(k):
         labels[i] = np.searchsorted(rs, roots[i])
-    return _clusters_k(labels, nc, rel, dd, seen, brg, bi, rng, scan)
+    return _clusters_k(labels, nc, rel, dd)
 
 
 @njit(cache=True)
@@ -1884,7 +1768,8 @@ EXTRA = dict(
     # runs once the car has stood back_after s (its score charges the heading error, man_w_mu)
     mu_max=0.0,
     # weave cap (a_weave > 0): for two consecutive boxes passed on opposite sides, the S between them needs the
-    # curvature 4 dd / l^2 (dd: lateral change of the body line, l: free length between the boxes); reach
+    # curvature 4 dd / l^2 (dd: lateral change of the body line, l: free length between the boxes, as measured: no
+    # assumed obstacle depth); reach
     # sqrt(a_weave / kappa) (>= v_weave_min) by the end of the first box (planned from the boxes and DP sides, not
     # from the MPC path: the MPC assumes the braking the car then lags)
     a_weave=0.0, v_weave_min=1.0, weave_pre=0.3,
@@ -1911,12 +1796,14 @@ EXTRA = dict(
 )
 
 
-# kwargs deleted on 2026-11-19 (options off in every profile, and the back-off / tight retry that the arc search
-# replaced; see the module docstring): a clear error instead of 'unknown'
+# kwargs deleted on 2026-11-19 (options off in every profile, the back-off / tight retry that the arc search
+# replaced, and the obstacle-size priors hidden_depth / w_max / min_width; see the module docstring): a clear error
+# instead of 'unknown'
 REMOVED = ('a_lat_fb', 'gain_comp', 'yaw_lim', 'gg', 'gg_min', 'swerve_w', 'a_acc_launch', 'v_launch', 'escape',
            'vis_obs_stop', 'box_mono', 'occl_ext', 'occl_fix', 'debug', 'jit', 'solver', 'hp_all', 'acc_model',
            'shift_ws', 'osqp_eps', 'osqp_iter', 'osqp_rho_int', 'osqp_rho', 'osqp_tlim', 'vis_copy', 'back_ref_min',
-           'back_grow', 'back_v', 'back_k', 'back_tmax', 'back_chk', 'back_m_wall', 'back_m_obs', 'tight_kw')
+           'back_grow', 'back_v', 'back_k', 'back_tmax', 'back_chk', 'back_m_wall', 'back_m_obs', 'tight_kw',
+           'hidden_depth', 'w_max', 'min_width')
 
 
 class CorridorMPC:
@@ -1929,7 +1816,7 @@ class CorridorMPC:
             t_react=0.04, v_end_scale=1.0,
             # geometry / margins
             m_hard=0.04, m_hard_v=0.006, c_pref=0.12, wall_clear=0.16, wall_clear_v=0.02, wall_clear_vmax=4.0, wall_pref=0.28,
-            obs_pad_s=0.06, obs_pad_d=0.02, hidden_depth=0.43, min_width=0.30, w_max=0.43,
+            obs_pad_s=0.06, obs_pad_d=0.02,
             # perception
             obs_edt=0.09, r_max=9.0, link=0.22, blind_after_wrap=0.07, carve=True,
             # DP
@@ -1978,7 +1865,8 @@ class CorridorMPC:
         for k, v in kw.items():
             if k in REMOVED:
                 raise KeyError(f'parameter {k} was removed on 2026-11-19 (see the module docstring; last version '
-                               f'with it: work/advice_fix/refactor/reference/drivers)')
+                               f'with it: work/advice_fix/refactor/reference/drivers, for hidden_depth / w_max / '
+                               f'min_width work/advice_fix/frozen/cmpc_berlin_tt.py.pre_sizefree)')
             if k not in p:
                 raise KeyError(f'unknown parameter {k}')
             p[k] = v
@@ -2023,8 +1911,7 @@ class CorridorMPC:
         _predict_k(np.zeros((1, 3)), 0.03, 0.02, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.05, 0.0, 0.0, 1.0)
         z32 = np.zeros(2, dtype=np.float32)
         for ok_ in (np.ones(2, dtype=np.bool_), np.zeros(2, dtype=np.bool_)):
-            _boxes_k(np.array([0, 1]), ok_, z32, z32, z32, z32, z32, z32, np.array([5, 1079]), np.ones(1080), self.MW,
-                     self.W, 0.0, float(self.L), 9.0, 0.22)
+            _boxes_k(np.array([0, 1]), ok_, z32, z32, z32, z32, self.MW, self.W, 0.0, float(self.L), 9.0, 0.22)
         _passes(np.ones(3), np.ones(2), self.tab_plan)
         _fwd(np.ones(3), np.ones(2), 1.0, 1.0, self.tab_plan)
         _cluster_k(np.zeros(3), np.zeros(3), 0.1)
@@ -2415,8 +2302,6 @@ class CorridorMPC:
         self.sol = None             # previous MPC solution: (stations, X (N+1,5), w (N))
         self.prev_sides = []
         self.seen_boxes = []
-        self.box_conf = []
-        self.conf_idx = {}          # s bucket -> indices into box_conf (lookup cost independent of lap length)
         self._ps_cache = [None, None, None]   # (list, bucket index, memo) of prev_sides / seen_boxes for _first_match
         self._sb_cache = [None, None, None]
         self.box_age = []
@@ -2439,7 +2324,6 @@ class CorridorMPC:
         self.stalls = []            # (t, extra hold time) of the call gaps > 1.75 periods in the last 5 s
         self.out_pos = False        # previous pose / yaw sample was rejected as an outlier (see _observe)
         self.out_yaw = False
-        self._no_latch = False      # teleport call: perception skipped, the extent latches are not updated
         self.odo = 0.0              # metres driven (|v| dt) since the start
         self.lap_boxes = 0          # DP calls with boxes in this lap
         self.lap_clear = False
@@ -2759,7 +2643,6 @@ class CorridorMPC:
         self.act_mem = np.zeros(0, dtype=np.int16)
         self.act_x, self.act_y, self.act_s, self.act_d = (np.zeros(0, dtype=np.float32) for _ in range(4))
         self.act_ok = np.zeros(0, dtype=np.bool_)
-        self._view = None
 
     def _view_of(self, lx, ly, yaw):
         """range, bearing and beam index of every remembered cell from the LiDAR (float32 numpy math, as before)"""
@@ -2772,9 +2655,8 @@ class CorridorMPC:
     def _perceive(self, scan, lx, ly, yaw, t):
         """scan hits farther than obs_edt from the map -> remembered obstacle cells; free-space carving.  The per-cell
         map attributes (x, y, s, d, ok) and memory counts are kept in arrays aligned with the sorted cell ids, so the
-        per-call work touches only those; the cells' view of the scan is kept for _boxes"""
+        per-call work touches only those"""
         cy, sy = math.cos(yaw), math.sin(yaw)
-        self._view = None
         if t >= self.blind_until:
             cells = _hits_k(scan, float(lx), float(ly), cy, sy, self.ca, self.sa, float(self.r_max), self.ox, self.oy,
                             self.res, self.W, self.H, self.edt, float(self.obs_edt), self.mres, self.MW)
@@ -2783,92 +2665,33 @@ class CorridorMPC:
                  self.act_ok) = _merge_k(self.active, self.act_mem, self.act_x, self.act_y, self.act_s, self.act_d,
                                          self.act_ok, cells, self.cell_x, self.cell_y, self.cell_s, self.cell_d,
                                          self.cell_ok)
-        if self.active.size == 0:
+        if self.active.size == 0 or not self.carve:
             return
         view = self._view_of(lx, ly, yaw)
-        if self.carve:
-            keep = _carve_k(self.act_mem, view[0], view[2], scan)
-            if not keep.all():
-                for nm in ('active', 'act_mem', 'act_x', 'act_y', 'act_s', 'act_d', 'act_ok'):
-                    setattr(self, nm, getattr(self, nm)[keep])
-                view = tuple(v[keep] for v in view)
-        self._view = view
+        keep = _carve_k(self.act_mem, view[0], view[2], scan)
+        if not keep.all():
+            for nm in ('active', 'act_mem', 'act_x', 'act_y', 'act_s', 'act_d', 'act_ok'):
+                setattr(self, nm, getattr(self, nm)[keep])
 
     def _boxes(self, s_car, scan, lx, ly, yaw):
-        """cluster remembered cells near the planning window into Frenet boxes [s_lo, s_hi, d_lo, d_hi].
-        The hidden back is added (hidden_depth); a lateral end that the current scan shows bounded by a closer
-        return (occluded) is extended to the largest possible footprint width (w_max).  Selection, clustering and
-        per-cluster statistics in _boxes_k with the cells' view of this scan from _perceive, then the latch logic of
-        _extent_latch per cluster"""
+        """cluster remembered cells near the planning window into Frenet boxes [s_lo, s_hi, d_lo, d_hi], sorted by s_lo:
+        the measured extent of the cells, at least ds long, padded by obs_pad_s / obs_pad_d.  No obstacle size is
+        assumed: unseen parts are left to the sight envelope (see the module docstring)"""
         if self.active.size == 0:
             return []
-        view = self._view if self._view is not None else self._view_of(lx, ly, yaw)
-        rmin, rmax, dmin, dmax, nseen, bmean, occl = _boxes_k(
-            self.active, self.act_ok, self.act_s, self.act_x, self.act_y, self.act_d, view[0], view[1], view[2], scan,
-            self.MW, self.W, float(s_car), float(self.L), float(self.n * self.ds + 1.0), float(self.link))
+        rmin, rmax, dmin, dmax = _boxes_k(
+            self.active, self.act_ok, self.act_s, self.act_x, self.act_y, self.act_d, self.MW, self.W, float(s_car),
+            float(self.L), float(self.n * self.ds + 1.0), float(self.link))
         out = []
         half = self.mres / 2
         s32 = np.float32(s_car)           # ss = rel + s_car is float32 (numpy casting); min/max commute with it
         for c in range(rmin.shape[0]):
             s_lo, s_hi = float(rmin[c] + s32) - half, float(rmax[c] + s32) + half
             d_lo, d_hi = float(dmin[c]) - half, float(dmax[c]) + half
-            s_hi = max(s_hi, s_lo + self.hidden_depth)
-            d_lo, d_hi = self._extent_latch(s_lo, s_hi, d_lo, d_hi, bool(nseen[c] > 0 and abs(float(bmean[c])) < 1.1),
-                                            occl[c])
+            s_hi = max(s_hi, s_lo + self.ds)
             out.append([s_lo - self.obs_pad_s, s_hi + self.obs_pad_s, d_lo - self.obs_pad_d, d_hi + self.obs_pad_d])
         out.sort(key=lambda b: b[0])
         return out
-
-    def _conf_entry(self, smr, dcr, nflag):
-        """the first box_conf entry (insertion order) within 0.4 m in s and 0.35 m in d of (smr, dcr), else a new one;
-        entries are bucketed by s, so the lookup does not grow with the number of clusters seen in the lap"""
-        kb = math.floor(smr / 0.4)
-        best = None
-        for k in range(kb - 2, kb + 3):
-            for i in self.conf_idx.get(k, ()):
-                e = self.box_conf[i]
-                if abs(e[0] - smr) < 0.4 and abs(e[1] - dcr) < 0.35:
-                    if best is None or i < best:
-                        best = i
-                    break
-        if best is not None:
-            return self.box_conf[best]
-        ent = [smr, dcr] + [False] * nflag
-        self.conf_idx.setdefault(kb, []).append(len(self.box_conf))
-        self.box_conf.append(ent)
-        return ent
-
-    def _extent_latch(self, s_lo, s_hi, o_lo, o_hi, use, occl):
-        """lateral extent of one cluster from its observed cells [o_lo, o_hi]: an edge with free space beyond it
-        (beams past the edge return farther) is real and latched; an edge with a closer return beyond it is hidden
-        behind something and is extended to the largest footprint (w_max) until it is seen free.  Edges are told
-        apart by beam order (lower beam index = right = lower d while the car looks along the track).  Scan evidence
-        from _clusters_k: use = some cells seen and the cluster ahead (mean bearing < 1.1 rad), occl = (low-index
-        edge, high-index edge): 0 seen free, 1 hidden, 2 no information (only NaN beams beyond it)"""
-        ent = self._conf_entry(0.5 * (s_lo + s_hi), 0.5 * (o_lo + o_hi), 4)
-        if use and not self._no_latch:
-            for kc, oc in ((2, occl[0]), (3, occl[1])):
-                if oc == 2:
-                    continue                  # no information about this edge (only NaN beams beyond it)
-                if not oc:
-                    ent[kc] = True
-                    ent[kc + 2] = False
-                elif not ent[kc]:
-                    ent[kc + 2] = True
-        d_lo, d_hi = o_lo, o_hi
-        if ent[5] and not ent[3]:
-            d_hi = max(d_hi, o_lo + self.w_max)
-        if ent[4] and not ent[2]:
-            d_lo = min(d_lo, o_hi - self.w_max)
-        if d_hi - d_lo < self.min_width:
-            if ent[2] and not ent[3]:
-                d_hi = d_lo + self.min_width
-            elif ent[3] and not ent[2]:
-                d_lo = d_hi - self.min_width
-            else:
-                dc = 0.5 * (d_lo + d_hi)
-                d_lo, d_hi = dc - self.min_width / 2, dc + self.min_width / 2
-        return d_lo, d_hi
 
     @staticmethod
     def _first_match(lst, cache, smid, dc, ts, td):
@@ -3082,9 +2905,7 @@ class CorridorMPC:
             teleport = math.hypot(x - xp_, y - yp_) > 0.5 + 1.5 * max(abs(v), abs(vp_)) * (t - tp_)
         jump_d = 0.0 if self.pose_prev is None else math.hypot(x - self.pose_prev[1], y - self.pose_prev[2])
         self.pose_prev = (t, x, y, v)
-        # perception is skipped on a teleport call: the compiled _boxes then used the previous call's view of the
-        # remembered cells (ranges / bearings from the old pose) and the extent latches were set from it
-        self._no_latch = teleport
+        # perception is skipped on a teleport call
         if teleport:
             self.fi = None
             self.s_prev = None
@@ -3092,15 +2913,13 @@ class CorridorMPC:
             self.sol_bad = True
             self.prof = None
             self.dp_res = None
-            self._view = None
             if jump_d > 2.0:
-                # relocated (not a glitch): what was remembered, the side commitments and the latches belong to the
-                # old place / pose (v1's lap-wrap test cleared them on a backward jump, the teleport branch skips it)
+                # relocated (not a glitch): what was remembered and the side commitments
+                # belong to the old place / pose (v1's lap-wrap test cleared them on a backward jump, the teleport
+                # branch skips it)
                 self._mem_clear()
                 self.prev_sides = []
                 self.seen_boxes = []
-                self.box_conf = []
-                self.conf_idx = {}
         # command history: keep what can still act (largest latency hypothesis) plus the command acting before it
         k_old = 0
         while k_old + 1 < len(self.hist) and self.hist[k_old + 1][0] < t - 0.3 - self.lat_max:
@@ -3151,8 +2970,6 @@ class CorridorMPC:
             self.blind_until = t + self.blind_after_wrap
             self.prev_sides = []
             self.seen_boxes = []
-            self.box_conf = []
-            self.conf_idx = {}
             if self.obs_mem < 0.0:
                 self.lap_clear = self.lap_boxes == 0 and self.odo > 0.5 * self.L
                 self.lap_boxes = 0
