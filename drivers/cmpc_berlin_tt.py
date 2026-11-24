@@ -4,7 +4,7 @@ single-track model + speed profile) for a known track with or without static obs
 One class, CorridorMPC; the configurations are kwargs profiles: profiles/berlin_tt.json / berlin_tt_safe.json (clear
 track), profiles/berlin_obs.json (random static obstacles: the obstacle options below on).  drivers.cmpc_berlin_obs
 re-exports the class under its older import path.  Input per call: act(scan, x, y, yaw, v, yaw_rate, t) -> (steering
-angle, speed); in the exam setup the pose arguments come from drivers.lidar_loc.LidarLocDriver (LiDAR scan-to-map
+angle, speed); in the GT-free setup the pose arguments come from drivers.lidar_loc.LidarLocDriver (LiDAR scan-to-map
 localisation), never from ground truth.
 
 Pipeline per act():
