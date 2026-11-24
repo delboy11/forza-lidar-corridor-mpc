@@ -4,7 +4,7 @@ pose.
 Why: the time-trial driver (drivers.cmpc_berlin_tt:CorridorMPC, profile profiles/berlin_tt.json = "FAST") was fed the
 simulator's ground truth (/car_state/pose_GT, /car_state/odom_GT).  LidarLocDriver wraps it (or any driver with the
 act(scan, x, y, yaw, v, yaw_rate, t) interface, e.g. drivers.corridor_mpc_v2:CorridorMPC for obstacles) and feeds it its
-own estimate of (x, y, yaw, v, yaw_rate) instead.  Results and design notes: work/lidar_loc/REPORT.md.
+own estimate of (x, y, yaw, v, yaw_rate) instead.
 
 What the estimator uses (and nothing else):
   * the LiDAR scan (1080 beams, 4.7 rad FOV, mounted LIDAR_X = 0.27 m ahead of the pose point along the heading),
@@ -27,7 +27,12 @@ flight from before a teleport once matched the old place); if no candidate passe
 car stands right in front of an obstacle, a stale scan), the pose is taken as given.  act() never raises.
 
 Inner drivers: any act(scan, x, y, yaw, v, yaw_rate, t) driver; tested with cmpc_berlin_tt (FAST, berlin_tt.json),
-corridor_mpc_v2 and cmpc_berlin_obs (berlin_obs.json: creeps at 0.6 m/s, backs off at -0.3 m/s).
+corridor_mpc_v2 and cmpc_berlin_obs (berlin_obs.json: forward arc manoeuvres at 0.45 m/s, never a negative speed).
+Measured-noise perception (noise_adapt, on by default): the inner driver's obstacle perception was tuned at the
+localizer's nominal beam noise sig_b; the beam noise the localizer measures in every scan (rms_ema) scales the inner's
+obstacle threshold obs_edt and sets a running-median window over adjacent beams for the scan handed to the inner
+driver (see _noise_adapt).  At the nominal noise both are the inner driver's own; the localizer always uses the raw
+scan.
 DART / DAgger: note_applied(steer, speed) after every act() tells the expert the command that was actually sent
 (rewrites the localizer's and the inner driver's command history and the inner's a_cmd).
 
@@ -38,7 +43,7 @@ Estimator (per act(), ~0.5-1 ms):
      6-49 ms.  The number of steps since the last scan is chosen per scan by the scan evidence (every count from 1 to the
      stamp-based guess + 1 is predicted and registered; Laplace objective + a learned prior around stamp difference x
      estimated step rate); an identical scan means no step (nothing updated, last command repeated).  loc clock='wall'
-     restores round(stamp difference / 10 ms) (v3; offline harness only).
+     restores round(stamp difference / 10 ms) (offline simulation only).
   1. prediction: EKF state s = [x, y, yaw, v, r, beta] at the pose point (the simulator's CG reference point), steering
      angle tracked deterministically; propagated in 10 ms steps over the interval since the last scan with the issued
      commands and RK4 on the single-track model (v >= 0.5 m/s; kinematic model below and for every negative speed,
@@ -49,7 +54,8 @@ Estimator (per act(), ~0.5-1 ms):
      selected hypothesis: every `stride`-th valid beam endpoint (LiDAR offset modelled) against the signed distance
      field of the map (bilinear), residual = SDF - (sdf_off + sdf_off_b |cos incidence|) (the simulator's ray-marcher
      stops inside the first occupied pixel), Huber weights, gate 0.25 m in the first iteration and ~5 sigma later
-     (obstacles >= 0.15 m from the walls, unmapped objects, max-range / inf / NaN beams are ignored).  The prior keeps
+     (endpoints off the mapped surfaces -- obstacles, unmapped objects -- and max-range / inf / NaN beams are
+     ignored).  The prior keeps
      the along-corridor direction defined where the walls alone do not; the scan information is deflated by
      info_scale (beam errors are correlated through the map pixels); beam sigma adapts to the measured residuals.
   3. speed and yaw rate are EKF states: the command-driven model carries them between scans, the registered poses
@@ -180,9 +186,8 @@ def _prop(Ht, Hs, Hv, nh, tl, tb, t0, n, s, delta, c):
             r += h / 6.0 * (k1[4] + 2.0 * k2[4] + 2.0 * k3[4] + k4[4])
             beta += h / 6.0 * (k1[5] + 2.0 * k2[5] + 2.0 * k3[5] + k4[5])
         else:
-            # kinematic model below 0.5 m/s and for every negative speed (the simulator switches back to the
-            # single-track model below -0.5 m/s, which is unstable in reverse: a latency hypothesis pulled to -1.5 m/s
-            # during a full-lock back-off diverged; the drivers reverse at <= 0.3 m/s)
+            # kinematic model below 0.5 m/s and for every negative speed (the single-track model is unstable for a
+            # car rolling backwards, which a latency hypothesis can predict for a short time)
             x += v * math.cos(psi) * h
             y += v * math.sin(psi) * h
             r = v * math.tan(dm) / WB
@@ -543,7 +548,7 @@ class LidarLocalizer:
         stride=2, r_min=0.06, r_max=20.0, sig_b=0.014, sig_ang=0.0005, sdf_off=-0.005, sdf_off_b=-0.015, huber=2.0,
         gate=0.25, gate2_min=0.06, gate2_k=5.0,
         inl_thr=0.08, info_scale=3.0, n_iter=4,
-        # process noise per 10 ms step (std): x, y, yaw, v, r, beta (replay grid on GT-driven recordings, REPORT.md)
+        # process noise per 10 ms step (std): x, y, yaw, v, r, beta (tuned offline on recorded drives)
         q_xy=0.002, q_yaw=0.001, q_v=0.03, q_r=0.15, q_beta=0.005,
         # initial covariance (std)
         p0_xy=0.05, p0_yaw=0.03, p0_v=0.1, p0_r=0.1, p0_beta=0.02,
@@ -577,7 +582,7 @@ class LidarLocalizer:
         # clock: 'sim' = number of physics steps per scan from the scan evidence (prior: Gaussian around stamp
         # difference x rate, variance n_var + (n_sig1 n_exp)^2, n_var = EMA of the squared deviation of decisive
         # choices, >= n_var_min); rate (steps / stamp second) from choices better than the runner-up by rate_margin
-        # while v > rate_vmin, forgetting rate_lam per update; 'wall' = round(dt / 10 ms) (v3)
+        # while v > rate_vmin, forgetting rate_lam per update; 'wall' = round(dt / 10 ms)
         clock='sim', n_var0=0.36, n_var_min=0.04, n_var_alpha=0.02, n_sig1=0.1, rate0=100.0, rate_margin=9.0,
         rate_vmin=1.5, rate_lam=0.99,
     )
@@ -785,8 +790,8 @@ class LidarLocalizer:
         return b[0], b[2]
 
     def _polish(self, scan, b):
-        """repeat the refine from the chosen candidate until it moves < 1 mm: along a flat direction (berlin s ~ 30 m)
-        the robust Gauss-Newton stalled 35-55 mm short of the optimum at the same RMS"""
+        """repeat the refine from the chosen candidate until it moves < 1 mm: along a flat direction of the scan cost
+        (a long straight corridor) the robust Gauss-Newton can stall a few cm short of the optimum at the same RMS"""
         for _ in range(3):
             b2 = self.refine(scan, b[0])
             moved = math.hypot(b2[0][0] - b[0][0], b2[0][1] - b[0][1])
@@ -829,7 +834,7 @@ class LidarLocalizer:
         chooses the number of physics steps since the last scan among candidates around (t - t_wall) * rate by the
         scan evidence (the ROS bridge steps the physics with a jittery wall-clock timer, slower than real time, and
         publishes on another timer: 1-3 steps between 50 Hz calls whose stamps differ by 6-49 ms); rate (steps per
-        stamp second) is estimated from the decisive choices.  clock='wall': round((t - t_wall) / 10 ms) (v3).
+        stamp second) is estimated from the decisive choices.  clock='wall': round((t - t_wall) / 10 ms).
         An identical scan (republished, no physics step in between) changes nothing (self.n_last = 0)."""
         m = self.map
         r = self._ranges(scan)
@@ -980,6 +985,23 @@ class LidarLocalizer:
 
 
 # ---------------------------------------------------------------------------------------------------- driver wrapper
+def median_beams(scan, n):
+    """running median over n (odd) adjacent beams; the window shrinks symmetrically at the two ends of the scan.
+    Non-finite ranges (no return) count as infinitely far: one dropped beam between returns is filled in, a run of
+    them stays 'no return'.  n < 3: the scan as it is"""
+    r = np.asarray(scan, dtype=np.float64)
+    if n < 3:
+        return r
+    h = n // 2
+    r = np.where(np.isnan(r), np.inf, r)
+    out = r.copy()
+    out[h:r.size - h] = np.median(np.lib.stride_tricks.sliding_window_view(r, n), axis=1)
+    for i in range(1, h):
+        out[i] = np.median(r[:2 * i + 1])
+        out[r.size - 1 - i] = np.median(r[r.size - 2 * i - 1:])
+    return out
+
+
 def _load_kwargs(profile):
     if profile is None:
         return {}
@@ -1003,11 +1025,13 @@ class LidarLocDriver:
       shadow        evaluation only: the inner driver gets GT, the estimator runs alongside (tuning / replay)
       eval_log      evaluation only: record estimate - GT after the command is computed
       loc           LidarLocalizer parameters
+      noise_adapt   the inner driver's obstacle perception follows the beam noise the localizer measures (see act())
+      med_max       largest median window of noise_adapt (beams)
     """
 
     def __init__(self, inner='drivers.cmpc_berlin_tt:CorridorMPC', profile='profiles/berlin_tt.json',
                  inner_kwargs=None, init='gt', forbid_gt=False, shadow=False, eval_log=False, record=False,
-                 loc=None, map_name=None, use_inner_c=True, init_force=10, **extra):
+                 loc=None, map_name=None, use_inner_c=True, init_force=10, noise_adapt=True, med_max=9, **extra):
         kw = _load_kwargs(profile)
         kw.update(inner_kwargs or {})
         kw.update(extra)                     # unknown keys go to the inner driver (e.g. map_name from run_avoid.sh)
@@ -1023,6 +1047,11 @@ class LidarLocDriver:
         mod, cls = inner.split(':')
         self.inner = getattr(importlib.import_module(mod), cls)(**kw)
         self.loc = LidarLocalizer(self.map_name, **loc)
+        # measured-noise perception (noise_adapt): the obstacle threshold of the inner driver at the nominal beam noise
+        self.noise_adapt = bool(noise_adapt)
+        self.med_max = int(med_max)
+        self.n_med = 1
+        self.edt0 = float(self.inner.obs_edt) if self.noise_adapt and hasattr(self.inner, 'obs_edt') else None
         if init not in ('gt', 'global', 'start'):
             raise ValueError(f'init must be gt, global or start, not {init}')
         if forbid_gt and init == 'gt':
@@ -1094,7 +1123,28 @@ class LidarLocDriver:
         self.init_src = src
         return ok
 
+    def _noise_adapt(self):
+        """the inner driver's perception was tuned at the localizer's nominal beam noise sig_b.  With the noise the
+        localizer measures (rms_ema: smoothed RMS of the scan-to-map residuals of the inlier beams), rho =
+        max(1, rms_ema / sig_b):
+          * the obstacle-cell threshold (a hit farther than obs_edt from every occupied map cell) becomes obs_edt * rho,
+            i.e. the same number of noise standard deviations as at the nominal noise;
+          * the scan handed to the inner driver (obstacle cells, free-space carving, sight) is the running median over
+            n adjacent beams, n = the largest odd number <= (pi / 2) rho^2 (the window at which the median's standard
+            error is back at sig_b; pi / 2 = the median's asymptotic variance factor), at most med_max.
+        The localizer keeps the raw scan.  At the nominal noise (rho = 1) both are the inner driver's own."""
+        sig = max(self.loc.sig_b, self.loc.rms_ema)
+        n = int(0.5 * math.pi * (sig / self.loc.sig_b) ** 2)
+        self.n_med = max(1, min(n - (n + 1) % 2, self.med_max))
+        if self.edt0 is not None:
+            self.inner.obs_edt = max(self.edt0, self.edt0 / self.loc.sig_b * sig)
+
+    def _inner_scan(self, scan):
+        return median_beams(scan, self.n_med) if self.noise_adapt else scan
+
     def act(self, scan, x, y, yaw, v, yaw_rate, t):
+        if self.noise_adapt:
+            self._noise_adapt()
         t = float(t)
         if self.t0 is None:
             self.t0 = t
@@ -1125,7 +1175,7 @@ class LidarLocDriver:
             try:
                 est = self.loc.step(tr, scan, t_lat, c)
             except (np.linalg.LinAlgError, ValueError, ZeroDivisionError) as exc:
-                # numerical failure (never seen after v6): restart the filter around the current estimate
+                # numerical failure: restart the filter around the current estimate
                 s_keep = self.loc.s.copy() if self.loc.s is not None else None
                 self.stats['loc_exc'] = self.stats.get('loc_exc', 0) + 1
                 if self.stats['loc_exc'] <= 3:
@@ -1151,11 +1201,11 @@ class LidarLocDriver:
         if self.lat_own:
             self.inner.t_lat = self.loc.t_lat_est
         if self.shadow:
-            steer, speed = self.inner.act(scan, x, y, yaw, v, yaw_rate, t)          # evaluation only
+            steer, speed = self.inner.act(self._inner_scan(scan), x, y, yaw, v, yaw_rate, t)    # evaluation only
             self.loc.add_command(self.loc.t, steer, speed)
         else:
             # the inner driver runs on the localizer's simulator clock (its actuator / delay models count 10 ms steps)
-            steer, speed = self.inner.act(scan, *est, self.loc.t)
+            steer, speed = self.inner.act(self._inner_scan(scan), *est, self.loc.t)
             self.loc.add_command(self.loc.t, steer, speed)
         self.last_cmd = (steer, speed)
         self._issued = True
@@ -1199,8 +1249,8 @@ class LidarLocDriver:
             hypotheses),
           * the last entry of the inner driver's command history (inner.hist: servo / sideslip / latency / tyre models),
           * the inner driver's a_cmd (jerk-limit state): a_cmd='implied' (default) = the acceleration the applied speed
-            command produces under the inner's command law (hold-compensated P-controller inverse, as
-            tln/berlin/collect.py sync_expert), 'expert' = keep the expert's own, or a number.
+            command produces under the inner's command law (hold-compensated P-controller inverse, as the data
+            collector's sync_expert does), 'expert' = keep the expert's own, or a number.
         Uses no ground truth (the estimated speed only where the expert's speed command was clipped).  Do not set
         attributes on the wrapper itself (driver.a_cmd = ... would not reach the inner driver): use this hook or
         driver.inner."""

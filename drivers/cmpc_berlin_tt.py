@@ -1,238 +1,117 @@
-"""Design C "corridor_mpc", version 2 for the berlin no-obstacle time trial (work/berlin_tt/COMBINE.md).
+"""Corridor MPC: one planner (DP side choice on a Frenet grid -> corridor) and one controller (spatial LTV-MPC on the
+single-track model + speed profile) for a known track with or without static obstacles.
 
-cmpc_berlin_tt = cmpc_berlin_line (65088a80) = corridor_mpc_v2 (808cc1ba) + kwarg raceline_file + kwarg lat_alat:
-  lat_alat = [t0, t1, a1] (None = v2): delay-adaptive lateral acceleration.  The online command-latency estimate
-  t_lat (v2's multiple-model lat_est, 10 ms steps) scales a_lat and a_lat_hard linearly from their values at
-  t_lat <= t0 down to a1 (a_lat_hard by the same ratio) at t_lat >= t1.  a_lat 14 is clean up to ~60 ms command delay
-  on berlin but hit the bottom-hairpin exit at 65-75 ms; a_lat 12 is clean there (COMBINE.md).  At ROS-like timing
-  (estimate 0.02-0.04 s) nothing changes: bit-identical to lat_alat=None.
-The time trial is a kwargs profile:
-profiles/berlin_tt.json (fast) and profiles/berlin_tt_safe.json (more margin), both with the reference line
-maps_ext/berlin/tt/mtr_def_0.2.json (md5 f18868f4).  Neither profile relaxes the sight / stop envelopes
-(v_vis_safe stays 2.5): the driver stays fully obstacle-aware.  Two stall-compensation code options were tried and dropped (no gain
-under 100 ms stalls; COMBINE.md, work/berlin_tt/comb/cmpc_berlin_tt_stallexp.py).
-
-cmpc_berlin_line header:
-Design C "corridor_mpc", version 2 + berlin reference-line option (work/berlin/raceline_REPORT.md).
-
-cmpc_berlin_line = corridor_mpc_v2 (808cc1ba) + kwarg raceline_file: a reference line shipped with the driver
-(e.g. maps_ext/berlin/*.json) replaces the map raceline inside the driver only (DP deviation cost, MPC reference,
-Frenet frame, wall tables, horizon end speed).  Its s = 0 is re-anchored on the map raceline's finish line
-(s = 0 of global_traj_wpnts_iqp), so the lap-scoped obstacle memory is still cleared where the race manager
-redraws the layout.  raceline_file=None (default) is exactly v2.
-
-v2 header:
-Design C "corridor_mpc", version 2 (robustness round, work/rob2/INTEGRATION.md).
-
-v2 = the original (drivers/corridor_mpc_v1.py) + the five rob2 workstreams, merged by hand in this order: review
-(latent-bug fixes: Frenet re-acquisition, monotonic clock, long gaps, non-finite inputs, pose jumps, solver failures),
-compute (numba kernels, same numerics), timing (online latency estimate, measured call period, hold compensation),
-model (online tyre-stiffness scale, adaptive measurement filters) and maps (raceline repair, geometric curvature
-limit in the DP, speed-dependent wall clearance).  Each round is described below.
+One class, CorridorMPC; the configurations are kwargs profiles: profiles/berlin_tt.json / berlin_tt_safe.json (clear
+track), profiles/berlin_obs.json (random static obstacles: the obstacle options below on).  drivers.cmpc_berlin_obs
+re-exports the class under its older import path.  Input per call: act(scan, x, y, yaw, v, yaw_rate, t) -> (steering
+angle, speed); in the exam setup the pose arguments come from drivers.lidar_loc.LidarLocDriver (LiDAR scan-to-map
+localisation), never from ground truth.
 
 Pipeline per act():
-  1. state estimation / delay compensation: the steering servo (3.2 rad/s, command latency + 2-step
-     buffer) and the speed P-controller are simulated from the commands this driver issued; the CG
-     sideslip (not measured) is estimated with the single-track model driven by the measured yaw rate
-     and corrected by the course angle of successive poses; the state is predicted with the nonlinear
-     single-track model to the time the new steering command bites.
-  2. perception: scan hits -> map frame; hits farther than `obs_edt` from any occupied map cell
-     (distance transform of hyhall12_orig) are obstacle cells.  Lap-scoped memory (cleared when s wraps,
-     with a short blind window for the stale scan) and free-space carving of cells the beams see through.
-     Cells are clustered; each cluster becomes a Frenet box of its measured extent (no obstacle size is assumed;
-     see 'Size-free boxes' below).
-  3. DP over a Frenet grid picks one consistent side for every visible obstacle (all of them, not only
-     the closest), with a side-flip penalty (hysteresis) that becomes almost hard close to the obstacle.
-     The chosen sides define an exact corridor lb(s) <= d <= ub(s) for the body line (obstacle and wall
-     bounds already inflated by the collision-box half width + margin).
-  4. spatial LTV-MPC (HPIPM) on the simulator's own linear-tyre single-track model in Frenet coordinates:
-     states d, mu (yaw rel. raceline), beta, r, delta; input steering rate (|.| <= 3.2 rad/s); exact
-     discretisation per station along the planned speed profile, load transfer from the planned
-     acceleration.  Corridor constraints on three points of the collision box (soft, heavy penalty),
-     soft lateral-acceleration limit |v r| <= a_lat_hard.
-  5. speed profile on the MPC path: lateral-acceleration limit, planned braking only within the
-     steerable (yaw-stable) deceleration, plus an emergency envelope: stop (with the larger, still stable
-     deceleration) before a closed corridor, and reach the first path point the scan cannot see no faster
-     than v_vis_safe.  Emergency brake (fast jerk) when the MPC needs corridor slack near the car.
+  1. state estimation / delay compensation: the steering servo (3.2 rad/s, command latency + 2-step buffer) and the
+     speed P-controller are simulated from the commands this driver issued; the CG sideslip (not measured) is
+     estimated with the single-track model driven by the measured yaw rate and corrected by the course angle of
+     successive poses; the state is predicted with the nonlinear single-track model to the time the new steering
+     command bites.
+  2. perception: scan hits -> map frame; hits farther than obs_edt from every occupied map cell (distance transform of
+     the map) are obstacle cells.  Lap-scoped memory (cleared when s wraps, with a short blind window for a stale
+     scan) and free-space carving of cells the beams see through.  Cells are clustered; each cluster becomes a Frenet
+     box of its measured extent (see 'Boxes' below).
+  3. DP over a Frenet grid picks one consistent side for every visible box (all of them, not only the closest), with a
+     side-flip penalty (hysteresis) that becomes almost hard close to the box.  The chosen sides define a corridor
+     lb(s) <= d <= ub(s) for the body line (box and wall bounds inflated by the collision-box half width + margin).
+  4. spatial LTV-MPC (HPIPM) on the single-track model with linear tyres in Frenet coordinates: states d, mu (yaw
+     relative to the reference line), beta, r, delta; input steering rate (|.| <= 3.2 rad/s); exact discretisation per
+     station along the planned speed profile, load transfer from the acceleration the jerk-limited speed command will
+     really produce.  Corridor constraints on three points of the collision box (soft, heavy penalty), soft
+     lateral-acceleration limit |v r| <= a_lat_hard.  When the new speed profile changes the near-term acceleration by
+     more than resolve_da, the MPC is solved a second time with it.
+  5. speed profile on the MPC path: lateral-acceleration limit, planned braking only within the steerable
+     (yaw-stable) deceleration, plus emergency envelopes: stop (with the larger, still stable deceleration) before a
+     closed corridor, and reach the first path point the scan cannot see no faster than v_vis_safe.  Emergency brake
+     (not jerk limited, em_jerk) when the MPC needs corridor slack near the car; a small slack at low speed is a speed
+     cap instead (soft_em).
 
-Changes of the second development round (see work/corridor_mpc/):
-  * acc_model: the MPC's load-transfer model uses the acceleration the jerk-limited speed command will really
-    produce (_cmd_sim), not the bang-bang station-to-station acceleration of the speed profile.  That mismatch
-    made the predicted yaw rate 30-45 % wrong in corner entries; fixing it gave -0.3 s per lap at lower p99 |v r|.
-  * occl_fix: lateral edges of a cluster are told apart by beam order; an edge hidden behind something closer is
-    extended to the largest footprint until it is seen free (a single visible cell used to be extended the wrong
-    way, the hidden side of the second obstacle of a chicane was missed).  Removed on 2026-11-19 with the size priors
-    (below).
-  * min_gap_w: an obstacle side whose corridor to the wall is narrower than 6 cm is not offered to the DP (such
-    gaps open and close with every 2 cm of the estimate and caused late side flips); fallback without the rule.
-  * em_jerk: emergency braking is not jerk limited.
-  * resolve_da: when the new speed profile changes the near-term acceleration by > 2 m/s^2 (e.g. a swerve that
-    starts braking now), the MPC is solved a second time with it (load-transfer transients, p99 |v r| outliers).
-  * v_vis_safe: the first unseen path point must be reached at <= 2.5 m/s (not at standstill).
-Options that were off in every profile (tested, no net gain) were deleted on 2026-11-19 (work/advice_fix/refactor:
-a_lat_fb, gain_comp, yaw_lim, gg / gg_min, swerve_w, a_acc_launch / v_launch, escape, vis_obs_stop, box_mono,
-occl_ext / occl_fix, the debug dicts), together with the jit=False numpy reference code, the OSQP solver path and
-acc_model=False; commands are bit-identical.  The last version with them is frozen in
-work/advice_fix/refactor/reference/drivers/cmpc_berlin_tt.py (the reference for future kernel checks).  Passing a
-removed kwarg raises KeyError.
-
-Compute-time round (work/rob_compute/): act() spent most of its time in many small numpy calls (Python overhead,
-slow with the cold caches of a busy machine), in HPIPM (generic blasfeo build, ~130-180 us per IPM iteration, two
-solves when resolve_da fires) and, with noisy scans, in Python loops over the remembered cells / boxes and linear
-searches over lap-long lists; nothing per call scaled with the map, but the slowest calls (MPC phase with a re-solve)
-reached 30+ ms on a loaded machine.  The per-call numerics run in numba kernels (compiled / loaded in __init__, one
-signature each) that repeat the numpy code operation by operation (same results up to the last bit of a few
-transcendental functions; the numpy reference code is kept only in the frozen copy named above):
-  * MPC data straight into HPIPM's buffers (_mpc_hp_k, structure-aware expm), speed profile (_speed_k), the plan's
-    inputs (_plan_prep_k), DP grid / costs / back-tracking (_dp_k), actuator model loops (_obs_main_k, _obs_beta_k, _predict_k).
-  * perception: scan hits (_hits_k); the remembered cells keep their map attributes and counts in arrays aligned
-    with the sorted ids (_merge_k / _carve_k: no map-sized gathers, no sort-based set operations per call, no
-    map-sized count grid to allocate in reset()); the cells' view of the scan is computed once per call (numpy,
-    float32 as before) for carving and _boxes; selection, clustering and per-cluster statistics in _boxes_k.
-  * lookups in box_conf (grows over the lap; removed with the size priors on 2026-11-19), prev_sides and
-    seen_boxes are bucketed by s instead of linear scans.
-  The QP is still solved by HPIPM with the same settings: the commands stay within ~3e-9 of the reference code (a
-  few transcendental functions differ in the last bits).  Closed loop (16 seeds x 3 laps): nominal, lat50 and hz20
-  episodes are identical to the reference code; long map episodes drift apart late (lap times +-0.1 s, chaotic
-  small_hall more), failures per condition equal within +-2.  A custom IPM for this QP (~0.6 ms less per solve)
-  was tried and left out: its ~1e-4 different solutions change the outcomes from the first lap on
-  (work/rob2/compute_REPORT.md).
-Result (interleaved open-loop replays of recorded episodes, same machine load): act() p99 hz20 16.6 -> 8.4 ms,
-combo 24.7 -> 11.3, evans_esp 8.7 -> 4.5; mean 2-3x lower.
-
-Timing robustness (work/rob2/timing_REPORT.md): the command latency and the call rate are not known in advance.
-  * lat_est: the command latency is estimated online (multiple-model): the simulator's speed P-controller is driven
-    by this driver's own speed commands delayed by each candidate latency (0..150 ms, 10 ms steps) and compared with
-    the measured speed; the candidate with the smallest forgotten squared innovation is used for every delay model
-    (servo/sideslip estimate, prediction to the bite time, speed at the controller).  t_lat is only the prior
-    (with t_lat fixed at 0.03 lat65 had 0.44 failures per lap, 1.4 with the rest of these changes also off).
-  * t_period: the call period is measured (median of recent gaps) and used where t_call was assumed: steering target
-    = planned angle one period after the bite, jerk limit per call in _cmd_sim.
-  * hold_comp: a speed command is held for one period; it is chosen so that the P-controller's mean acceleration over
-    the hold equals the desired one (the plain inverse a / kp delivered 83 % of a braking request at 50 Hz, 65 % at
-    20 Hz; without it hz20 had 0.33 failures per lap).
-  * the MPC is also solved when its plan is older than 1.5 periods (a call after a stall), not only every second call.
-  Not splitting DP / MPC at low call rates (tested: better lat_acc at 20-30 Hz, ~1.75x compute per call) is not used.
-
-Model mismatch / noisy state inputs (work/rob2/model_REPORT.md):
-  * c_adapt: online tyre-stiffness scale c (mu * C_S of the linear tyre: friction and stiffness act alike).  A grid of
-    parallel single-track models (stiffness x extra command delay relative to the lat_est latency, _mm_prop) is driven
-    by the commands this driver sent; the output error against the measured yaw rate (3 s memory) picks c.  c scales
-    the model everywhere (sideslip observer, prediction, MPC, steerable-deceleration tables, DP curvature).  With the
-    nominal model a 20 % weaker tyre (cs80) ran into outer walls.  (The model workstream's own use of the extra delay
-    for the command timing, lat_adapt, is replaced by lat_est above.)
+Estimation and timing (all measured online, nothing assumed about the platform):
+  * lat_est: command latency by a multiple-model estimate (candidates lat_min..lat_max in 10 ms steps: the speed
+    P-controller driven by this driver's own commands delayed by each candidate, compared with the measured speed);
+    t_lat is only the prior.  Under the LiDAR wrapper the wrapper's own scan-based estimate is used instead.
+  * t_period: the call period is measured (median of recent gaps) and used for the steering target (planned angle one
+    period after the bite) and for the jerk limit per call; hold_comp: a speed command is held for one period, so it is
+    chosen to give the desired mean acceleration over the hold.  The MPC is also solved when its plan is older than
+    1.75 periods (a call after a stall).  stall_db: when held commands (call gaps > 1.75 periods) take more than
+    stall_db of the last 5 s, a_lat is lowered.  lat_alat: a_lat / a_lat_hard scaled down when the estimated latency
+    exceeds lat_alat[0].
+  * c_adapt: online tyre-stiffness scale c (a grid of parallel single-track models driven by the issued commands; the
+    output error against the measured yaw rate picks c); c scales the model everywhere (observer, prediction, MPC,
+    deceleration tables, DP curvature).
   * pose_filt: x, y, yaw, v, r are filtered against the model prediction with steady-state Kalman gains from the
-    measured noise level (innovation correlation, _gain): exact inputs keep gain 1 (no lag), 2 cm / 0.01 rad pose
-    noise gets ~0.1.  The course-angle sideslip correction is weighted by its noise (it amplified 2 cm position noise
-    to ~0.1 rad sideslip noise: steering oscillation, p99 |v r| 11.2, and wall points became phantom obstacles).
-    Pose jumps larger than pose_gate (localisation reset) are taken as they are, not smoothed in.
+    measured noise level (exact inputs keep gain 1); outlier gates (pose_out); pose jumps larger than pose_gate
+    (relocalisation) are taken as they are.  Invalid samples (non-finite values, a scan of the wrong length) repeat the
+    last command for a few calls, then stop.
+  * fg_check (off in the obstacle profile): open-loop check that the car follows the commands, which gates the
+    adaptive estimators.
 
-Unseen / narrow maps (work/rob2/maps_REPORT.md):
-  * line repair: a raceline tighter than the car can steer at all (small_hall: kappa 5.5 against tan(delta_max)/WB =
-    1.35) is replaced at start-up by the nearest line with |kappa| <= 1.0, a bounded curvature rate and wall clearance
-    (sparse least squares).  The car used to stop and creep at every hairpin (19 s laps without obstacles, 8 s now).
-    Only lines tighter than line_ktrig * tan(delta_max)/WB are replaced: hyhall12 and the other maps keep their own
-    raceline (repairing a marginal one, glc_ot_ez with max kappa 1.07, cost more than it gained).
-  * dp_kgeo: the DP charges slope changes that make the geometric path curvature kr / D + d'' / D^2 (D = 1 - kr d)
-    exceed the steering limit; it used to bound d'' only, so the inside of a tight turn looked as easy as the outside.
+Reference line (time trial):
+  * raceline_file: a reference line shipped with the driver replaces the map raceline inside the driver only (DP
+    deviation cost, MPC reference, Frenet frame, wall tables, horizon end speed); its s = 0 is anchored on the map
+    raceline's finish line, where the lap-scoped obstacle memory is cleared.
+  * line repair: a raceline tighter than line_ktrig * tan(steer_max) / wheelbase is replaced at start-up by the
+    nearest line with |kappa| <= line_kmax, a bounded curvature rate and wall clearance (sparse least squares).
+  * dp_kgeo / w_geo: the DP charges slope changes that make the geometric path curvature kr / D + d'' / D^2
+    (D = 1 - kr d) exceed the steering limit.
+  * wall_clear_v: the wall clearance grows with speed up to wall_clear_vmax (tracking error grows with speed).
+  * min_gap_w / min_gap_keep: a box side whose corridor to the wall is narrower than min_gap_w is not offered to the
+    DP (such gaps open and close with every few cm of the estimate); the side already chosen stays offered down to
+    a gap of min_gap_keep (hysteresis).  Fallback without the rule when no path exists.
 
-berlin with random static obstacles (profiles/berlin_obs.json = berlin_tt.json + obstacle options).  The options were
-a subclass, drivers.cmpc_berlin_obs.CorridorMPC, with its own copies of act() and _plan_rest(); on 2026-11-19 they were
-merged into this class (work/advice_fix/refactor).  Every option is off by default ('off' = the time-trial driver; at
-the merge the time-trial profiles drove bit-identically); drivers.cmpc_berlin_obs keeps the import path.
-
-Obstacle options (EXTRA; mechanisms they fix: work/berlin_obs/REPORT.md, M1-M6):
+Obstacle options (EXTRA; all off by default, i.e. the clear-track driver):
   * obstacle mode (obs_mem < 0: per lap): on in the first lap, in every lap after a lap in which a box was seen and
-    from the first box of a lap on; obs_kw = parameter overrides in that mode (t_react, sight envelope, low-speed
-    margins, gap rule).  A clear track is driven with the time-trial parameters from the second lap on.
-  * width-gated horizon frontier (v_hz, m_hz, w_front, hz_look, front_ramp): where the track near the horizon end is
-    narrower than w_front, the car must be able to reach v_hz there (an obstacle chicane can appear at the horizon
-    end and is not passable at speed); static ramped cap before it (M1).
-  * em_frac: the closed-corridor stop envelope again with em_frac of the emergency deceleration (M1 / M2 tracking).
-  * narrow-side closing in the DP (g_narrow, g_diff; part of the gap rule) (M3).
-  * slow DP (v_slow, kcap_slow, kmax_slow, dp_adec_slow, slow_pre, slow_len, m_slow, slow_commit): when the DP finds no
-    path, plan the curvature the car steers at v_slow (optionally releasing committed sides further than slow_commit)
-    and slow down to v_slow before the tight part instead of stopping (M1 / M4).
-  * checked creep and proximity guard (creep_slack, creep_chk, creep_m_obs, creep_m_wall, prox_v, prox_t): below
-    prox_v the body points along the planned path, and during a creep / soft drive-on along the steering arc, must
-    keep creep_m_obs / creep_m_wall from the measured obstacle cells / map walls, else the car stops (M4 / M6).
-  * low-speed manoeuvre = arc search (back_dist > 0 switches it on, back_after, back_max, man_*): the car has stood
-    (|v| < 0.1) for back_after s with t_stop set -> search sequences of up to 3 circular arcs of the simulator's
-    low-speed model ({forward, reverse} x steering {-1, -0.5, 0, 0.5, 1} STEER_MAX x the man_lens lengths; all 1- and
-    2-arc sequences, the man_beam best 2-arc sequences extended by one forward arc; the last arc forward).  Valid:
-    the body points every 5 cm keep man_m_wall from the map walls and man_m_obs from the remembered obstacle cells
-    (a car that starts closer may lose at most man_close).  Score: progress along the line (capped at man_goal)
-    - man_w_len length - man_w_mu |heading error| + man_w_clr min(margin, 0.1).  Per arc: stop, turn the wheels at
-    standstill, drive at man_v (reverse) / man_vf (forward), re-check the rest of the arc every call; the MPC takes
-    over after the last arc, or on a forward arc once its plan has been drivable for man_happy s (man_happy < 0:
-    only after the last arc).  A car still
-    reversing after a manoeuvre ended early (abort / timeout) is braked until it stands.  Nothing found: wait
-    back_after s and search again.  back_max limits the manoeuvres per place, not the searches (M4: infeasible
-    hairpin chicanes): n_back counts only searches that found a sequence, and is cleared once the car is more than
-    1.5 m ahead of or 3 m behind the line position of the first of them (or after a lap wrap / pose jump); with
-    n_back = back_max no search runs there any more and the car drives on only if the MPC finds a drivable plan.  A
-    failed search is not counted: it only restarts the back_after wait, so failed searches repeat every back_after s
-    with no limit while the car stands (6 in a row on harness seed 1114 o5 and emulator seed 1171 o5).
-  * heading guard (mu_max): stop when the heading error to the line exceeds mu_max (a car turning around).
+    from the first box of a lap on; obs_kw = parameter overrides in that mode (reaction time, sight envelope, margins,
+    gap rule).  A clear track is driven with the base parameters.
+  * width-gated horizon frontier (v_hz, m_hz, w_front, hz_look, front_ramp): what lies beyond the planning horizon is
+    unknown; where the free width near the horizon end is below w_front (a box there could close the track), the car
+    must be able to reach v_hz at the horizon end; a static ramped cap prepares for it.
+  * em_frac: the closed-corridor stop envelope again with em_frac of the emergency deceleration.
+  * narrow-side closing (g_narrow, g_diff): a box side narrower than g_narrow while the other side is wider by g_diff
+    is closed for the DP (the wide side is taken early).
+  * slow DP (v_slow, kcap_slow, kmax_slow, dp_adec_slow, slow_pre, slow_len, m_slow, slow_commit, a_lat_slow): when the
+    DP finds no complete path, plan again with the curvature the car steers at v_slow (optionally releasing committed
+    sides further away than slow_commit) and slow down to v_slow before the tight part instead of stopping.
+  * checked creep and proximity guard (creep_slack, creep_chk, creep_m_obs, creep_m_wall, prox_v, prox_t): below prox_v
+    the body points along the planned path, and during a soft drive-on along the steering arc, must keep creep_m_obs /
+    creep_m_wall from the measured obstacle cells / map walls, else the car stops (the 3-point MPC corridor does not
+    cover the box corners at large heading angles).
+  * heading guard (mu_max): stop when the heading error to the line exceeds mu_max (the Frenet linearisation breaks
+    down).
   * weave cap (a_weave, v_weave_min, weave_pre): two consecutive boxes passed on opposite sides -> reach
-    sqrt(a_weave / (4 dd / l^2)) by the end of the first box and hold it to the second (M7: weaves on the narrow
-    straight planned by the coarse DP that the car could not brake for in time).
-Options that were off in every profile were deleted on 2026-11-19 (work/advice_fix/refactor): obs_mem > 0
-(distance-based obstacle mode), vis_copy, back_ref_min, and the 'creep forbidden while blocked' mode (creep_slack >= 0
-with creep_chk <= 0); commands are bit-identical.  Frozen copy: work/advice_fix/refactor/reference/drivers.
-Behaviour changes of 2026-11-19 (work/advice_fix/behaviour; each paired against the previous state on fresh seeds,
-LiDAR-OBS on the harness with live-like timing and on the ROS-timing emulator; validation in work/advice_fix/integrate):
-  * the arc search above replaced three low-speed rules: the reverse back-off (back_v, back_k, back_grow, back_tmax,
-    back_chk, back_m_wall, back_m_obs: reverse along the steering of largest clearance, growing distance), the retry
-    with smaller corridor margins after it (tight_kw), and, in profiles/berlin_obs.json, creep (creep_after 1e9).
-    Creep (creep_after, creep_v) stays in act(): it is the time-trial profiles' only deadlock recovery (back_dist 0).
-  * a bad plan (slack > slack_bad or a failed solve) is steered by the MPC solution like every other plan.  The
-    pure-pursuit law on the DP path that used to steer it is gone; the bad flag still brakes (emergency), arms the
-    checked-creep veto and skips the proximity guard.  act() is shared, so the time-trial profiles changed too: on a
-    clear track they drive bit-identically, with obstacles or after pose jumps they do not (berlin_tt.json, 4 obstacles,
-    harness seeds 0-49, 3 laps: hits 3 -> 2 with GT, 9 -> 7 with the LiDAR wrapper; laps paired by lap index
-    -0.010 s (GT, 147 laps) / -0.021 s (LiDAR, 140 laps) per lap, median 0; in the kidnap tests with the time-trial
-    inner (seed 1, 4 obstacles, injected pose jumps) 2 of 6 runs gained an obstacle hit (one at ~4.4 m/s braking after the pose jump, one at ~0.5 m/s), baseline 0;
-    work/advice_fix/integrate, lap deltas recomputed in work/advice_fix/audit and followup: the earlier
-    '+0.05 / +0.06 s' paired laps by list position, and laps with a hit are missing from lap_times).
-  * profiles/berlin_obs.json sets fg_check false: offline every alarm of the command-following check was a false one
-    (yaw-rate channel, model error 0.36-0.58 rad/s against fg_thr_r 0.35) and its rollback stepped c_tyre.  The
-    obstacle driver no longer notices a second /drive source while it runs (run_avoid.sh refuses to start next to
-    another stack / driver node).
-  Tried and not taken: soft_em off (more stops, one hit after a manoeuvre) and the inner pose filter off (better on
-  the harness, worse on the emulator).
-Known gaps: right after a manoeuvre the MPC hand-back can touch an obstacle / wall at low speed: seen once in a
-rejected variant's run, once after an injected abort, and once with the GT obstacle driver (seed 1232 o4: an obstacle
-hit 0.66 s after a man_happy early hand-back; clean with man_happy -1).  The LiDAR obstacle driver had no hit during or
-within 3 s after a manoeuvre in 250 audit episodes (harness o4 / o5 1200-1299, emulator o5 1200-1249) and 300
-follow-up episodes (seeds 1300-1399:
-harness o4 / o5, emulator o4 / o5 on 1300-1349).  man_happy stays 0.2 (work/advice_fix/followup, paired against -1 on
-those seeds): off gave the LiDAR driver one more hit (seed 1336 o4, a wall touch during the full 3-arc sequence that the
-early hand-back had cut short) and no fewer stalls (0 / 0), the GT driver the same hits (4) and stalls (0), and made
-the laps it changed slower on average (mean +1.8 to +3.2 s per changed lap, up to +10 s; some got faster); the clear track is bit-identical.  A few
-layouts still stall after repeated failed searches (fresh seed 1046, lap 0, s 11.3); the brake after an aborted
-reverse arc never fired in a natural run (checked with injected aborts only); 50 ms command latency and pose noise
-were tested but not tuned for.
-  * wall_clear_v: the wall clearance grows with speed up to 4 m/s (tracking error in tight S-bends along the walls;
-    the front corner touched walls the plan cleared by a few cm).
-  * min_gap_keep: hysteresis of min_gap_w for the side already chosen (a narrow gap that shrank by 3 cm at 8 m/s
-    forced a flip 4 m before the obstacle).
+    sqrt(a_weave / (4 dd / l^2)) by the end of the first box (dd: lateral change of the body line, l: free length
+    between the boxes as measured, at least one station ds).
+  * forward arc search (arc_search, man_after, man_max, man_*): the low-speed recovery of the same driver.  It acts
+    only on a car that has stood (|v| < 0.1) for man_after s without a drivable plan (emergency, closed corridor or
+    guard veto).  Why it is not done by the MPC: the Frenet MPC plans a path along the reference line at driving speed
+    with a 3-point corridor and margins that grow with speed; a car standing next to a box, possibly at a large heading
+    angle, needs a short low-speed path whose whole body is checked against the measured obstacle points, which that
+    corridor cannot represent.  Search: sequences of up to 3 forward circular arcs of the simulator's low-speed model
+    (steering {-1, -0.5, 0, 0.5, 1} STEER_MAX x the man_lens lengths; all 1- and 2-arc sequences, the man_beam best
+    2-arc sequences extended by one more arc).  Valid: the body points every 5 cm keep man_m_wall from the map walls
+    and man_m_obs from the remembered obstacle cells (a car that starts closer may lose at most man_close).  Score:
+    progress along the line (capped at man_goal) - man_w_len length - man_w_mu |heading error| + man_w_clr
+    min(margin, 0.1).  Per arc: stop, turn the wheels at standstill, drive at man_vf, re-check the rest of the arc
+    every call (abort: stop); the MPC takes over after the last arc, or once its plan has been drivable for man_happy
+    s.  Nothing found: wait man_after s and search again.  man_max limits the manoeuvres per place (cleared once the
+    car is 1.5 m ahead of or 3 m behind the line position of the first of them, after a lap wrap or a pose jump).
+    Every arc drives forward: the driver never commands a negative speed.
+  * creep (creep_after, creep_v): the clear-track profiles' recovery (stopped for creep_after s -> creep along the
+    plan); the obstacle profile switches it off (creep_after 1e9) and uses the checked drive-on / arc search.
 
-Size-free boxes (2026-11-19, work/advice_fix/sizefree).  The boxes used three numbers copied from the race manager's
-0.30 m cubes: hidden_depth 0.43 (= 0.30 sqrt 2: unseen back side), w_max 0.43 (a lateral edge hidden behind something
-closer was extended to this width until seen free) and min_width 0.30.  They are gone (passing them raises KeyError).
-A box is the measured extent of its remembered cells (+ half a memory cell, + obs_pad_s / obs_pad_d), at least ds long
-(the MPC station spacing: its sampled corridor constraints could step over a shorter box).  What the scan has not seen
-is not filled in: a path point the scan cannot see (behind or beside an obstacle) is limited by the sight envelope
-(v_vis_safe), like any other unseen part of the track, and the box grows as the beams reach more of the object.
-The occlusion latch that applied w_max (beam order, box_conf) went with it.
-Cost (LiDAR-OBS, harness live-like timing, fresh seeds 1400-1499 x 3 laps, 0.30 m cubes, o4 + o5 = 600 laps, paired
-by lap index against the version with the priors): lap time equal (mean -0.07 / -0.11 s, median 0.000), collisions 3
-(1 obstacle, 2 wall) against 0; screening seeds 1600-1659: 2 against 2; other sizes / planks (seeds 1700-1719, 300
-laps) 4 against 1.  The priors made every box at least as large as a 0.30 m cube; that margin also covered the gap of
-the 3-point MPC corridor at large heading angles next to a box corner (most of the extra obstacle hits are in the
-s 22-26 hairpin chicane with the box measured to a few cm).  Rules that keep unseen space occupied until the beams
-have passed it (behind / beside the box, lap-scoped free-space grid) cost 0.14-1.4 s per lap and were not taken.
+Boxes: a box is the measured extent of its remembered cells (+ half a memory cell, + obs_pad_s / obs_pad_d), at least ds
+long (the MPC station spacing: its sampled corridor constraints could step over a shorter box).  No obstacle size is
+assumed: what the scan has not seen is not filled in; a path point the scan cannot see (behind or beside an obstacle)
+is limited by the sight envelope (v_vis_safe) like any other unseen part of the track, and the box grows as the beams
+reach more of the object.
+
+Removed parameters (REMOVED) raise KeyError when passed.
 """
 import json
 import math
@@ -1729,7 +1608,7 @@ class _Hpipm:
         return self.status.value, self.iters.value, self.sx.copy()
 
 
-# obstacle options (berlin_obs.json), all off by default (see the module docstring)
+# obstacle options (switched on by the obstacle profile), all off by default (see the module docstring)
 EXTRA = dict(
     # obstacle mode (obs_kw: parameter overrides while the mode is on, scalars read per call only)
     obs_mem=0.0,            # 0: the mode is always on (obs_kw always applied); < 0: per lap: on in the first lap, in
@@ -1752,24 +1631,24 @@ EXTRA = dict(
     # is wider by g_diff is closed for the DP (the wide side is taken early instead of the narrow one).  <0: off
     g_narrow=-1.0, g_diff=0.25,
     # creep / soft emergency guard: the plan is 'blocked' while it needs more than creep_slack of corridor slack within
-    # creep_dist of path (back-off trigger, checked creep).  <0: off
+    # creep_dist of path (arc-search trigger, checked creep).  <0: off
     creep_slack=-1.0, creep_dist=0.8,
     # checked creep (creep_chk > 0, required with creep_slack >= 0): the creep / soft drive-on of a blocked plan is
     # allowed while the body (front / middle / rear corners) moved creep_chk m along the kinematic arc of the commanded
     # steering keeps creep_m_obs from the remembered obstacle cells (measured surface points, not the padded boxes)
-    # and creep_m_wall from the map walls; otherwise the car stops (and may back off)
+    # and creep_m_wall from the map walls; otherwise the car stops (and the arc search may take over)
     creep_chk=0.0, creep_m_obs=0.04, creep_m_wall=0.03,
     # proximity guard (prox_v > 0): below prox_v m/s the planned path of the next max(creep_chk, prox_t v) m must keep
     # the body creep_m_obs from the measured obstacle cells and creep_m_wall from the walls, else the car stops (the
     # 3-point corridor of the MPC misses the box corners at large heading angles next to an obstacle corner)
     prox_v=0.0, prox_t=0.4,
     # heading guard (mu_max > 0): heading error to the line above mu_max rad in obstacle mode -> stop (the Frenet MPC
-    # linearisation breaks down; a full-lock swerve once turned the car around); with back_dist > 0 the arc search
-    # runs once the car has stood back_after s (its score charges the heading error, man_w_mu)
+    # linearisation breaks down; a full-lock swerve can turn the car around); with arc_search the arc search runs once
+    # the car has stood man_after s (its score charges the heading error, man_w_mu)
     mu_max=0.0,
     # weave cap (a_weave > 0): for two consecutive boxes passed on opposite sides, the S between them needs the
-    # curvature 4 dd / l^2 (dd: lateral change of the body line, l: free length between the boxes, as measured: no
-    # assumed obstacle depth); reach
+    # curvature 4 dd / l^2 (dd: lateral change of the body line, l: free length between the boxes as measured, at
+    # least one station ds: no assumed obstacle depth, no added length); reach
     # sqrt(a_weave / kappa) (>= v_weave_min) by the end of the first box (planned from the boxes and DP sides, not
     # from the MPC path: the MPC assumes the braking the car then lags)
     a_weave=0.0, v_weave_min=1.0, weave_pre=0.3,
@@ -1779,11 +1658,11 @@ EXTRA = dict(
     v_slow=-1.0, kcap_slow=1.1, kmax_slow=6, dp_adec_slow=5.0, slow_pre=2.0, slow_len=4.0, m_slow=0.1,
     slow_commit=None,       # [commit_d, commit_t] of a second slow-DP try that may release committed sides
     a_lat_slow=0.0,         # > 0: lateral acceleration of the slow DP's curvature limit (truly slow manoeuvres)
-    # low-speed manoeuvre (arc search, see the module docstring): back_dist > 0 switches it on (the value itself is
-    # not used); a search after the car has stood back_after s.  back_max = manoeuvres (successful searches) per
-    # place; a failed search is not counted and is repeated every back_after s with no limit
-    back_dist=0.0, back_after=1.0, back_max=3,
-    man_v=0.3, man_vf=0.45,     # reverse / forward speed (m/s; < 0.5: the simulator's kinematic regime)
+    # low-speed manoeuvre (forward arc search, see the module docstring): arc_search switches it on; a search after
+    # the car has stood man_after s without a drivable plan.  man_max = manoeuvres (successful searches) per place; a
+    # failed search is not counted and is repeated every man_after s while the car stands
+    arc_search=False, man_after=1.0, man_max=3,
+    man_vf=0.45,                # arc speed (m/s; < 0.5: the simulator's kinematic regime)
     man_lens=(0.35, 0.7, 1.2),  # arc lengths (m)
     man_m_wall=0.04, man_m_obs=0.06,
     man_tol=0.015,              # re-check while driving: clearance may fall this much below the search's floor
@@ -1791,19 +1670,18 @@ EXTRA = dict(
     man_w_len=0.1, man_w_mu=0.3, man_w_clr=1.0,
     man_beam=40,
     man_min_prog=0.05,          # a sequence must gain at least this much progress
-    man_happy=0.2,              # early hand-back once the MPC plan was drivable this long (s) on a forward arc, < 0 off
+    man_happy=0.2,              # early hand-back once the MPC plan was drivable this long (s) during a manoeuvre, < 0 off
     man_close=0.02,             # a car that starts closer than the margins may lose this much clearance (floor >= this)
 )
 
 
-# kwargs deleted on 2026-11-19 (options off in every profile, the back-off / tight retry that the arc search
-# replaced, and the obstacle-size priors hidden_depth / w_max / min_width; see the module docstring): a clear error
-# instead of 'unknown'
+# parameters that no longer exist (options without effect in any profile, the earlier low-speed rules and reverse
+# arcs of the manoeuvre, and assumed obstacle sizes): passing one raises a clear KeyError instead of 'unknown'
 REMOVED = ('a_lat_fb', 'gain_comp', 'yaw_lim', 'gg', 'gg_min', 'swerve_w', 'a_acc_launch', 'v_launch', 'escape',
            'vis_obs_stop', 'box_mono', 'occl_ext', 'occl_fix', 'debug', 'jit', 'solver', 'hp_all', 'acc_model',
            'shift_ws', 'osqp_eps', 'osqp_iter', 'osqp_rho_int', 'osqp_rho', 'osqp_tlim', 'vis_copy', 'back_ref_min',
            'back_grow', 'back_v', 'back_k', 'back_tmax', 'back_chk', 'back_m_wall', 'back_m_obs', 'tight_kw',
-           'hidden_depth', 'w_max', 'min_width')
+           'hidden_depth', 'w_max', 'min_width', 'back_dist', 'back_after', 'back_max', 'man_v')
 
 
 class CorridorMPC:
@@ -1845,7 +1723,7 @@ class CorridorMPC:
             c_adapt=True, c_grid=(0.6, 1.4, 9), c_tau=3.0, c_prior=1.0, c_vmin=2.0, l_grid=(-0.02, 0.05, 8),
             l_prior=100.0, c_tables=True,
             t_call=0.02, em_jerk=400.0, v_vis_safe=2.5, resolve_da=2.0, resolve_n=10,
-            # FIXUP (2026-11-12): soft emergency at low speed (slack-only emergency with slack <= soft_em becomes a
+            # soft emergency at low speed (slack-only emergency with slack <= soft_em becomes a
             # soft_em_v speed cap once vv <= soft_em_arm); lat_est switch rule relative to the cost above the speed-noise
             # floor; adaptive estimators gated on 'the car follows the commands' (fg_win s open-loop check, rollback);
             # pose / yaw outlier gate (pose_out sigmas + pose_out_floor); stall-adaptive lateral acceleration (stall_db)
@@ -1858,15 +1736,13 @@ class CorridorMPC:
             # reference line shipped with the driver (json: arrays s, x, y[, vx] or a wpnts list / map-style file);
             # None: the map raceline.  Relative paths are resolved against the avoid/ directory.
             raceline_file=None,
-            # delay-adaptive a_lat: [t0, t1, a1] (see header); None = v2
+            # delay-adaptive a_lat: [t0, t1, a1] (see the module docstring); None: off
             lat_alat=None,
         )
         p.update(EXTRA)
         for k, v in kw.items():
             if k in REMOVED:
-                raise KeyError(f'parameter {k} was removed on 2026-11-19 (see the module docstring; last version '
-                               f'with it: work/advice_fix/refactor/reference/drivers, for hidden_depth / w_max / '
-                               f'min_width work/advice_fix/frozen/cmpc_berlin_tt.py.pre_sizefree)')
+                raise KeyError(f'parameter {k} was removed (see REMOVED in drivers/cmpc_berlin_tt.py)')
             if k not in p:
                 raise KeyError(f'unknown parameter {k}')
             p[k] = v
@@ -1883,7 +1759,7 @@ class CorridorMPC:
         self._load_occ()
         self._load_track()
         self._load_map()
-        self.hp = self._build_hpipm()        # HPIPM of the CasADi install (the OSQP fallback was removed)
+        self.hp = self._build_hpipm()        # HPIPM of the CasADi install
         ang = ANG_MIN + ANG_INC * np.arange(1080)
         self.ca, self.sa = np.cos(ang), np.sin(ang)
         _hits_k(np.ones(1080), 0.0, 0.0, 1.0, 0.0, self.ca, self.sa, 9.0, self.ox, self.oy, self.res, self.W, self.H,
@@ -1972,11 +1848,11 @@ class CorridorMPC:
         self.obs_on = None
         self._set_mode(True)
         self._front_tables()
-        # arc search: body points and the 30 primitives (direction, steering, length)
+        # arc search: body points and the forward primitives (steering, length)
         bp = np.array(BODY_PTS, dtype=float)
         self._bpx, self._bpy = bp[:, 0], bp[:, 1]
         st = np.array([-1.0, -0.5, 0.0, 0.5, 1.0]) * STEER_MAX
-        self._prims = np.array([(dr, dl, ln) for dr in (1.0, -1.0) for dl in st for ln in self.man_lens])
+        self._prims = np.array([(dl, ln) for dl in st for ln in self.man_lens])
         self.man_stats = []         # one entry per search (time, candidates, best sequence)
 
     def _decel_tables(self, c):
@@ -2017,8 +1893,8 @@ class CorridorMPC:
         self.fvx = np.interp(self.fs, s, vx)
         self.line_repaired = False
         if self.line_kmax > 0.0 and float(np.max(np.abs(self.fk))) > self.line_ktrig * math.tan(STEER_MAX) / WB:
-            # the raceline of an imported map can be tighter than the car can steer at all (small_hall: kappa 5.5
-            # against tan(delta_max) / WB = 1.35): every Frenet quantity (DP curvature, MPC linearisation, wall tables)
+            # the raceline of an imported map can be tighter than the car can steer at all (kappa far above
+            # tan(delta_max) / WB = 1.35): every Frenet quantity (DP curvature, MPC linearisation, wall tables)
             # then works against an impossible reference.  Replace it by the nearest line with |kappa| <= line_kmax
             # and wall clearance.  A line that is only marginally tight (max kappa 1.0 .. 1.2) is kept: it is drivable.
             xo, yo = self.fx.copy(), self.fy.copy()
@@ -2091,7 +1967,7 @@ class CorridorMPC:
         L = float(s[-1])
         csx = CubicSpline(s, x, bc_type='periodic')
         csy = CubicSpline(s, y, bc_type='periodic')
-        nf = int(round(L / 0.05))      # 840 on hyhall12
+        nf = int(round(L / 0.05))      # 5 cm stations
         fs = np.arange(nf) * (L / nf)
         dx, dy = csx(fs, 1), csy(fs, 1)
         ddx, ddy = csx(fs, 2), csy(fs, 2)
@@ -2333,13 +2209,13 @@ class CorridorMPC:
         self.tr_extra = None
         self.slow_at = None
         self.weaves = []
-        self.man = None             # running manoeuvre (arc sequence, see _backoff)
+        self.man = None             # running manoeuvre (arc sequence, see _manoeuvre)
         self.tr_mode = None         # diagnostics: ('settle' | 'drive', arc index) while a manoeuvre commands
-        self.n_back = 0
-        self.back_s = 0.0
+        self.n_man = 0
+        self.man_s = 0.0
         self._creep_blocked = False
-        if not hasattr(self, 'n_back_tot'):
-            self.n_back_tot = 0
+        if not hasattr(self, 'n_man_tot'):
+            self.n_man_tot = 0
 
     def _clock(self, t):
         """internal time: relative to the first call after reset() and never running backwards.  A clock that jumped
@@ -2387,7 +2263,7 @@ class CorridorMPC:
         cur = self.lat_J[self.lat_j]
         # switch rule relative to the part of the cost above the noise floor R W that every hypothesis carries: with
         # speed noise, lat_hyst of the whole cost was more than the signal difference between hypotheses and the first
-        # estimate never changed (speed noise 0.4: 0.04 for a whole run at true 0.08).  R = 0: the old rule.
+        # estimate never changed.  R = 0: switch on the whole cost.
         if self.lat_J[j] + 1e-5 < cur - self.lat_hyst * max(cur - R * self.lat_W, 0.0):
             self.lat_j = j
         self.t_lat = float(self.lat_c[self.lat_j])
@@ -2914,9 +2790,8 @@ class CorridorMPC:
             self.prof = None
             self.dp_res = None
             if jump_d > 2.0:
-                # relocated (not a glitch): what was remembered and the side commitments
-                # belong to the old place / pose (v1's lap-wrap test cleared them on a backward jump, the teleport
-                # branch skips it)
+                # relocated (not a glitch): what was remembered and the side commitments belong to the previous
+                # place / pose (the lap-wrap test, which clears them otherwise, is skipped on a teleport call)
                 self._mem_clear()
                 self.prev_sides = []
                 self.seen_boxes = []
@@ -3064,9 +2939,9 @@ class CorridorMPC:
             old = self.plan
             if (new['failed'] and old is not None and not old['bad'] and self.n_fail <= 2 and not full
                     and t - old['t'] < 0.12):
-                # a failed solve (HPIPM min-step / NaN status) used to mean an emergency brake + geometric path
-                # following for that call; the previous plan is 1-2 calls old, exactly what every DP-only call of the
-                # split schedule drives on -> keep it (emergency only after the third failure in a row)
+                # a failed solve (HPIPM min-step / NaN status): the previous plan is 1-2 calls old, exactly what
+                # every DP-only call of the split schedule drives on -> keep it (emergency only after the third
+                # failure in a row)
                 pass
             else:
                 self.plan = new
@@ -3141,10 +3016,10 @@ class CorridorMPC:
             self.a_cmd = min(self.a_cmd, 0.0)
             if self.t_stop is None and vv < 0.15:
                 self.t_stop = t
-        if self.back_dist > 0.0:
-            if self.n_back and (wrapped or teleport or s_c - self.back_s > 1.5 or s_c < self.back_s - 3.0):
-                self.n_back = 0
-            rc = self._backoff(t, x, y, yaw, v, mu0, s_c)
+        if self.arc_search:
+            if self.n_man and (wrapped or teleport or s_c - self.man_s > 1.5 or s_c < self.man_s - 3.0):
+                self.n_man = 0
+            rc = self._manoeuvre(t, x, y, yaw, v, mu0, s_c)
             if rc is not None:
                 steer, speed = rc
                 self.a_cmd = 0.0
@@ -3318,7 +3193,11 @@ class CorridorMPC:
             dd = (d2 - d1) * s2
             if dd <= 0.0:
                 continue
-            ln = max(b2[0] - b1[1] + 0.3, 0.3)
+            # l: the measured free length b2[0] - b1[1] between the boxes (measured extents + obs_pad_s, no obstacle
+            # size).  The MPC corridor holds the CG point to box 1's bound up to b1[1] and from b2[0] on (its other
+            # points lie ahead on the tangent, which is on the safe side), so the planned S fits exactly into this
+            # length.  Floor: one MPC station ds (the S cannot be resolved shorter)
+            ln = max(b2[0] - b1[1], self.ds)
             kap = 4.0 * dd / (ln * ln)
             v_w = max(math.sqrt(self.a_weave / kap), self.v_weave_min)
             out.append((b1[1] - self.weave_pre, b2[0], v_w))
@@ -3364,11 +3243,10 @@ class CorridorMPC:
 
     def _body_clr(self, x, y, yaw, dl, dist):
         """smallest clearance of the body points (rear / middle / front corners) to the map walls and to the
-        remembered obstacle cells after reversing dist m with steering dl (kinematic arc; dist 0: current pose)"""
-        sb = dist
-        yw = yaw - sb * math.tan(dl) / WB
+        remembered obstacle cells after driving dist m forward with steering dl (kinematic arc; dist 0: current pose)"""
+        yw = yaw + dist * math.tan(dl) / WB
         ym = 0.5 * (yaw + yw)
-        cx, cy = x - sb * math.cos(ym), y - sb * math.sin(ym)
+        cx, cy = x + dist * math.cos(ym), y + dist * math.sin(ym)
         c, s_ = math.cos(yw), math.sin(yw)
         P = np.array([(cx + lx_ * c - ly_ * s_, cy + lx_ * s_ + ly_ * c)
                       for lx_, ly_ in BODY_PTS])
@@ -3407,17 +3285,17 @@ class CorridorMPC:
     def _fwd_clear(self, x, y, yaw, dl, dist):
         """the body stays creep_m_obs / creep_m_wall clear when driving dist m forward with steering dl"""
         for i in (1, 2, 3):
-            cw, co = self._body_clr(x, y, yaw, dl, -dist * i / 3)
+            cw, co = self._body_clr(x, y, yaw, dl, dist * i / 3)
             if cw < self.creep_m_wall or co < self.creep_m_obs:
                 return False
         return True
 
     # ---- low-speed manoeuvre (arc search)
     @staticmethod
-    def _arc(x, y, yaw, dr, dl, u):
-        """pose after the signed arc length dr * u with steering dl (exact circle; broadcasting)"""
-        th = dr * u * np.tan(dl) / WB
-        c = dr * u * np.sinc(0.5 * th / np.pi)
+    def _arc(x, y, yaw, dl, u):
+        """pose after driving the arc length u forward with steering dl (exact circle; broadcasting)"""
+        th = u * np.tan(dl) / WB
+        c = u * np.sinc(0.5 * th / np.pi)
         return x + c * np.cos(yaw + 0.5 * th), y + c * np.sin(yaw + 0.5 * th), yaw + th
 
     def _obs_field(self, x, y):
@@ -3476,12 +3354,11 @@ class CorridorMPC:
         F = dict(x=np.array([x]), y=np.array([y]), w=np.array([yaw]), i=np.array([i0]), m=np.array([np.inf]),
                  ln=np.array([0.0]))
         seqs, cands, n_eval = [()], [], 0
+        K = int(math.ceil(float(P[:, 1].max()) / 0.05))
+        u = np.minimum(np.arange(1, K + 1)[None, :] * 0.05, P[:, 1:2])
         for depth in range(3):
-            q = np.flatnonzero(P[:, 0] > 0) if depth == 2 else np.arange(len(P))
-            K = int(math.ceil(float(P[q, 2].max()) / 0.05))
-            u = np.minimum(np.arange(1, K + 1)[None, :] * 0.05, P[q, 2:3])
             X, Y, W = self._arc(F['x'][:, None, None], F['y'][:, None, None], F['w'][:, None, None],
-                                P[None, q, 0:1], P[None, q, 1:2], u[None])
+                                P[None, :, 0:1], u[None])
             n_eval += X.shape[0] * X.shape[1]
             cw, co = self._clr(X, Y, W, fld)
             m = np.minimum(np.minimum(cw - fw, co - fo).min(-1), F['m'][:, None])
@@ -3490,17 +3367,16 @@ class CorridorMPC:
                 break
             I = self._track(F['i'][a], X[a, b][:, None], Y[a, b][:, None])[:, 0]
             xe, ye, we, me = X[a, b, -1], Y[a, b, -1], W[a, b, -1], m[a, b]
-            ln = F['ln'][a] + P[q[b], 2]
+            ln = F['ln'][a] + P[b, 1]
             ds = (self._s_at(I, xe, ye) - s0 + 0.5 * self.L) % self.L - 0.5 * self.L
             mu = _wrap(we - self.fpsi[I])
             sc = (np.minimum(ds, self.man_goal) - self.man_w_len * ln - self.man_w_mu * np.abs(mu)
                   + self.man_w_clr * np.minimum(me, 0.1))
-            fwd = P[q[b], 0] > 0
-            for k in np.flatnonzero(fwd & (ds >= self.man_min_prog)):
-                cands.append((float(sc[k]), float(ds[k]), seqs[a[k]] + (int(q[b[k]]),)))
-            keep = np.arange(a.size) if depth == 0 else np.argsort(-(ds - 0.3 * ~fwd))[:self.man_beam]
+            for k in np.flatnonzero(ds >= self.man_min_prog):
+                cands.append((float(sc[k]), float(ds[k]), seqs[a[k]] + (int(b[k]),)))
+            keep = np.arange(a.size) if depth == 0 else np.argsort(-ds)[:self.man_beam]
             F = dict(x=xe[keep], y=ye[keep], w=we[keep], i=I[keep], m=me[keep], ln=ln[keep])
-            seqs = [seqs[a[k]] + (int(q[b[k]]),) for k in keep]
+            seqs = [seqs[a[k]] + (int(b[k]),) for k in keep]
         best = max(cands) if cands else None
         self.man_stats.append(dict(ms=round((time.perf_counter() - t0) * 1e3, 1), n=n_eval, valid=len(cands),
                                    fw=round(fw, 3), fo=round(fo, 3),
@@ -3508,12 +3384,12 @@ class CorridorMPC:
                                                                    [tuple(round(float(v), 3) for v in P[j]) for j in best[2]])))
         return None if best is None else ([tuple(float(v) for v in P[j]) for j in best[2]], fw, fo)
 
-    def _arc_clear(self, x, y, yaw, dr, dl, rem):
+    def _arc_clear(self, x, y, yaw, dl, rem):
         """the rest of the current arc keeps the search's floors (- man_tol) with the cells seen now"""
         if rem <= 0.02:
             return True
         u = np.minimum(np.arange(1, int(math.ceil(rem / 0.05)) + 1) * 0.05, rem)
-        cw, co = self._clr(*self._arc(x, y, yaw, dr, dl, u), self._obs_field(x, y))
+        cw, co = self._clr(*self._arc(x, y, yaw, dl, u), self._obs_field(x, y))
         M = self.man
         return bool(np.all(cw >= M['fw'] - self.man_tol) and np.all(co >= M['fo'] - self.man_tol))
 
@@ -3522,31 +3398,29 @@ class CorridorMPC:
         self.tr_mode = None
         self.t_stop = t_stop
 
-    def _backoff(self, t, x, y, yaw, v, mu, s_c):
+    def _manoeuvre(self, t, x, y, yaw, v, mu, s_c):
+        """arc manoeuvre of a car that has stood man_after s without a drivable plan: (steer, speed) while it
+        commands, None when the MPC plan drives"""
         M = self.man
         if M is None:
             self.tr_mode = None
-            if v < -0.03:
-                # still reversing after an aborted / timed-out manoeuvre: brake (0.8, as the old back-off did; the
-                # pipeline never commands reverse, and a speed >= 0 command alone brakes a reversing car only gently)
-                return (self.hist[-1][1] if self.hist else 0.0), 0.8
-            if not (self.t_stop is not None and t - self.t_stop > self.back_after and abs(v) < 0.1
-                    and self.n_back < self.back_max):
+            if not (self.t_stop is not None and t - self.t_stop > self.man_after and abs(v) < 0.1
+                    and self.n_man < self.man_max):
                 return None
             res = self._man_search(x, y, yaw)
             if res is None:
-                self.t_stop = t               # nothing found: wait back_after s, then search again
+                self.t_stop = t               # nothing found: wait man_after s, then search again
                 return None
             self.man = M = dict(seq=res[0], k=0, phase=0, fw=res[1], fo=res[2])
-            if self.n_back == 0:
-                self.back_s = s_c
-            self.n_back += 1
-            self.n_back_tot += 1
-        dr, dl, ln = M['seq'][M['k']]
+            if self.n_man == 0:
+                self.man_s = s_c
+            self.n_man += 1
+            self.n_man_tot += 1
+        dl, ln = M['seq'][M['k']]
         if M['phase'] == 0:
             # stop, then turn the wheels at standstill (servo 3.2 rad/s + latency)
             if abs(v) > 0.03:
-                return dl, (0.8 if v < 0 else 0.0)
+                return dl, 0.0
             prev = self.hist[-1][1] if self.hist else 0.0
             M.setdefault('ts', t + abs(dl - prev) / STEER_RATE + 0.08)
             if t < M['ts']:
@@ -3555,18 +3429,18 @@ class CorridorMPC:
             M.update(phase=1, x0=x, y0=y, yaw0=yaw, t1=t)
         k = math.tan(dl) / WB
         rem = ln - (abs(_wrap(yaw - M['yaw0'])) / abs(k) if abs(k) > 0.05 else math.hypot(x - M['x0'], y - M['y0']))
-        if t - M['t1'] > 2.0 * ln / self.man_v + 1.5:
-            self._end(t)                      # timeout: stop, search again
-            return dl, (0.8 if v < -0.03 else 0.0)      # brake a reversing car (see above)
+        if t - M['t1'] > 3.0 * ln / self.man_vf + 1.5:
+            self._end(t)                      # timeout (3 x the nominal arc time + 1.5 s): stop, search again
+            return dl, 0.0
         if rem <= 0.01:
             M.update(k=M['k'] + 1, phase=0)
             M.pop('ts', None)
             M.pop('t_happy', None)
             if M['k'] >= len(M['seq']):
-                self._end(None)               # last (forward) arc done: the MPC takes over
+                self._end(None)               # last arc done: the MPC takes over
                 return None
-            return self._backoff(t, x, y, yaw, v, mu, s_c)
-        if dr > 0 and self.man_happy >= 0.0:
+            return self._manoeuvre(t, x, y, yaw, v, mu, s_c)
+        if self.man_happy >= 0.0:
             # early hand-back: the MPC (planned every call from the current state) has a drivable plan again
             if not self._creep_blocked and not self.plan['emergency']:
                 if t - M.setdefault('t_happy', t) >= self.man_happy:
@@ -3574,9 +3448,9 @@ class CorridorMPC:
                     return None
             else:
                 M.pop('t_happy', None)
-        if not self._arc_clear(x, y, yaw, dr, dl, rem):
+        if not self._arc_clear(x, y, yaw, dl, rem):
             self._end(t)
             self._creep_blocked = True
-            return dl, (0.8 if v < -0.03 else 0.0)
+            return dl, 0.0
         self.tr_mode = ('drive', M['k'])
-        return dl, (self.man_vf if dr > 0 else -self.man_v)
+        return dl, self.man_vf
